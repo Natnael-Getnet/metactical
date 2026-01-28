@@ -58,7 +58,7 @@ class ItemSupplierImportTool(Document):
 		return file_content
 	
 	def check_headers(self, file_content):
-		expected_headers = ["Item Supplier Table Name", "Supplier Part Number", "UPC/EAN", "Quantity To Update", "Item Code"]
+		expected_headers = ["Item Supplier Table Name", "Supplier Part Number", "UPC/EAN", "Quantity To Update", "Item Code", "Wholesale Price"]
 
 		for header in file_content[0]:
 			if header not in expected_headers:
@@ -85,6 +85,8 @@ class ItemSupplierImportTool(Document):
 			try:
 				updated_qty = str(updated_qty).replace('+', '').strip()
 				updated_qty = float(updated_qty)
+				if updated_qty > 50:
+					updated_qty = 50
 			except Exception:
 				frappe.log_error(f"Skipping invalid qty {updated_qty} for supplier part number {supplier_part_no}, Item code {item_code}")
 				continue
@@ -97,10 +99,11 @@ class ItemSupplierImportTool(Document):
 					supplier_exists = False
 					for supplier in item.supplier_items:
 						if supplier.name == name:
-							supplier.ifw_supplier_qoh = updated_qty
-							supplier.ifw_sqohtimestamp = frappe.utils.now_datetime()
-							item.save()
-							frappe.db.commit()
+							if not (supplier.ifw_supplier_qoh == updated_qty or (supplier.ifw_supplier_qoh > 49 and updated_qty == 50)):
+								supplier.ifw_supplier_qoh = updated_qty
+								supplier.ifw_sqohtimestamp = frappe.utils.now_datetime()
+								item.save()
+								frappe.db.commit()
 							supplier_exists = True
 							break
 					if not supplier_exists:
