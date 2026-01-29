@@ -5,7 +5,6 @@ from frappe import _
 from frappe.model.mapper import get_mapped_doc, map_child_doc
 from frappe.utils import flt
 from erpnext.stock.doctype.stock_entry.stock_entry import StockEntry
-from erpnext.stock.doctype.serial_no.serial_no import update_serial_nos_after_submit
 import barcode as _barcode
 from barcode.writer import ImageWriter
 from io import BytesIO
@@ -32,7 +31,7 @@ class CustomStockEntry(StockEntry):
 	
 	def set_actual_qty(self):
 		from erpnext.stock.stock_ledger import is_negative_stock_allowed
-
+		
 		for d in self.get("items"):
 			allow_negative_stock = is_negative_stock_allowed(item_code=d.item_code)
 			previous_sle = get_previous_sle(
@@ -57,6 +56,28 @@ class CustomStockEntry(StockEntry):
 				}
 			)
 			d.ais_target_qoh = target_previous_sle.get("qty_after_transaction")
+			
+			# Metactical Customization: For in-transit stock entries with material request,
+			# get stock level of final target warehouse from Material Request
+			if d.material_request:
+				# Get the target warehouse from the Material Request Item
+				mr_warehouse = frappe.db.get_value(
+					"Material Request Item",
+					d.material_request_item,
+					"warehouse"
+				)
+				
+				if mr_warehouse:
+					# Fetch stock level of the final target warehouse
+					mr_warehouse_sle = get_previous_sle(
+						{
+							"item_code": d.item_code,
+							"warehouse": mr_warehouse,
+							"posting_date": self.posting_date,
+							"posting_time": self.posting_time,
+						}
+					)
+					d.ais_active_qoh = mr_warehouse_sle.get("qty_after_transaction")
 
 			# validate qty during submit
 			if (

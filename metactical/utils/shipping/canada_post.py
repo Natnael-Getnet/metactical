@@ -32,7 +32,7 @@ class CanadaPost():
 	def set_default_headers(self):
 		self.sess.headers = {
 			'Accept': 'application/vnd.cpc.shipment-v8+xml',
-			'Content-Type': 'application/vnd.cpc.shipment-v8+xml',
+			'Content-Type': 'application/vnd.cpc.shipment-v8+xml; charset=utf-8',
 			'Accept-language': 'en-CA',
 			'Authorization': _basic_auth_str(self.settings.api_key, self.settings.get_password("api_secret"))
 		}
@@ -128,8 +128,9 @@ class CanadaPost():
 
 			body = frappe.render_template(
 				"metactical/utils/shipping/templates/canada_post/request/get_rate.xml", context)
-			response = self.get_response("/rs/ship/price", body, {'Accept': 'application/vnd.cpc.ship.rate-v4+xml',
-																  'Content-Type': 'application/vnd.cpc.ship.rate-v4+xml'})
+			response = self.get_response("/rs/ship/price", body, 
+							{'Accept': 'application/vnd.cpc.ship.rate-v4+xml',
+							'Content-Type': 'application/vnd.cpc.ship.rate-v4+xml; charset=utf-8'})
 			items = []
 			if response and response['price-quotes'] and response['price-quotes']['price-quote']:
 				for pq in response['price-quotes']['price-quote']:
@@ -221,8 +222,10 @@ class CanadaPost():
 					body = body.replace(char, replacement)
 
 				response = self.get_response(
-					f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/shipment", body, {'Accept': 'application/vnd.cpc.shipment-v8+xml',
-																									'Content-Type': 'application/vnd.cpc.shipment-v8+xml'})
+					f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/shipment", 
+								body, 
+								{'Accept': 'application/vnd.cpc.shipment-v8+xml',
+								'Content-Type': 'application/vnd.cpc.shipment-v8+xml; charset=utf-8'})
 				row = doc.append('shipments', {
 					'shipment_id': response['shipment-info']['shipment-id'],
 					'awb_number': response['shipment-info']['tracking-pin'],
@@ -310,7 +313,9 @@ class CanadaPost():
 			"metactical/utils/shipping/templates/canada_post/request/transmit_shipment.xml", context)
 		
 		response = self.get_response(
-				f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/manifest", body, headers={'Accept': 'application/vnd.cpc.manifest-v8+xml', 'Content-Type': 'application/vnd.cpc.manifest-v8+xml'})
+				f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/manifest", body, 
+				headers={'Accept': 'application/vnd.cpc.manifest-v8+xml', 
+				'Content-Type': 'application/vnd.cpc.manifest-v8+xml; charset=utf-8'})
 		
 		if response:
 			if isinstance(response['manifests']['link'], dict):
@@ -367,16 +372,227 @@ class CanadaPost():
 		groups = [group for group in groups if group in available_groups]
 		return groups
 
-	def get_available_groups(self):
+	def get_available_groups(self, return_links=False):
 		available_groups = []
 		response = self.get_response(
 			f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/group", None, 
 			headers={'Accept': 'application/vnd.cpc.shipment-v8+xml'}, method="GET")
 		
-		for group in response["groups"]["group"]:
-			available_groups.append(group["group-id"])
+		# Ensure groups is a list
+		groups = response["groups"]["group"]
+		if isinstance(groups, dict):
+			groups = [groups]
+		
+		for group in groups:
+			if return_links:
+				# Return both group-id and links structure
+				available_groups.append({
+					"group_id": group["group-id"],
+					"links": group.get("links", {})
+				})
+			else:
+				available_groups.append(group["group-id"])
 		
 		return available_groups
+
+	def get_group_shipments(self, group_id=None, group_links=None):
+		"""
+		Get all shipments for a specific group ID
+		Returns shipment details including references (ERP Shipment names)
+		
+		Args:
+			group_id: The group ID to fetch shipments for (optional if group_links provided)
+			group_links: Links dict from get_available_groups(return_links=True) (optional)
+		"""
+		shipments_data = []
+		
+		# If group_links provided, use them directly; otherwise fetch the group data
+		if group_links and 'link' in group_links:
+			links = group_links['link']
+		else:
+			# Fall back to fetching group data via API
+			if not group_id:
+				frappe.throw(_("Either group_id or group_links must be provided"))
+			
+			url = f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/shipment?groupId={group_id}"
+			headers = {'Accept': 'application/vnd.cpc.shipment-v8+xml'}
+			
+			try:
+				response = self.get_response(url, None, headers=headers, method='GET')
+			except Exception as e:
+				# If group has no shipments or other error, return empty list
+				frappe.log_error(
+					title=f"Canada Post - Get Group Shipments Error for {group_id}",
+					message=f"Error: {str(e)}\n{frappe.get_traceback()}"
+				)
+				return []
+			
+			if not response or 'shipments' not in response:
+				return []
+			
+			if 'link' not in response['shipments']:
+				return []
+			
+			links = response['shipments']['link']
+		
+		# Ensure links is a list
+		if isinstance(links, dict):
+			links = [links]
+		
+		for link in links:
+			if link.get('@rel') == 'self':
+				# This is the group link, skip it
+				continue
+			
+			try:
+				# Get individual shipment details
+				shipment_response = self.get_response(
+					link['@href'], 
+					None, 
+					headers={'Accept': link['@media-type']}, 
+					method='GET'
+				)
+				
+				if shipment_response and 'shipment-info' in shipment_response:
+					shipment_info = shipment_response['shipment-info']
+					
+					# Extract the data we need
+					shipment_data = {
+						'shipment_id': shipment_info.get('shipment-id'),
+						'tracking_pin': shipment_info.get('tracking-pin'),
+						'shipment_status': shipment_info.get('shipment-status'),
+						'group_id': group_id if group_id else shipment_info.get('group-id'),
+						'references': {}
+					}
+						
+					# Get customer references (this contains the ERP Shipment name)
+					if 'customer-references' in shipment_info:
+						refs = shipment_info['customer-references']
+						if 'customer-ref-1' in refs:
+							shipment_data['references']['ref_1'] = refs['customer-ref-1']
+						if 'customer-ref-2' in refs:
+							shipment_data['references']['ref_2'] = refs['customer-ref-2']
+					
+					# Get delivery address
+					if 'delivery-spec' in shipment_info and 'destination' in shipment_info['delivery-spec']:
+						dest = shipment_info['delivery-spec']['destination']
+						shipment_data['delivery_customer'] = dest.get('name', '')
+					
+					# Get service information
+					if 'delivery-spec' in shipment_info and 'service-code' in shipment_info['delivery-spec']:
+						shipment_data['service_code'] = shipment_info['delivery-spec']['service-code']
+					
+					shipments_data.append(shipment_data)
+			except Exception as e:
+				# Log error but continue with other shipments
+				frappe.log_error(
+					title=f"Canada Post - Get Shipment Details Error",
+					message=f"Error getting shipment from {link.get('@href', 'unknown')}: {str(e)}"
+				)
+				continue
+		
+		return shipments_data
+
+	def get_manifests_by_date_range(self, from_date, to_date):
+		"""
+		Get all manifests within a date range from Canada Post API.
+		
+		Args:
+			from_date: Start date in YYYY-MM-DD format
+			to_date: End date in YYYY-MM-DD format
+		
+		Returns:
+			list: List of manifest data with links
+		"""
+		# Convert dates to the format Canada Post expects (YYYYMMDD)
+		if isinstance(from_date, str):
+			from_date_obj = datetime.strptime(from_date, "%Y-%m-%d")
+		else:
+			from_date_obj = from_date
+		
+		if isinstance(to_date, str):
+			to_date_obj = datetime.strptime(to_date, "%Y-%m-%d")
+		else:
+			to_date_obj = to_date
+		
+		# Validate date range (max 90 days)
+		date_diff = (to_date_obj - from_date_obj).days
+		if date_diff > 90:
+			frappe.throw(_("Date range cannot exceed 90 days"))
+		
+		if date_diff < 0:
+			frappe.throw(_("'To Date' must be after 'From Date'"))
+		
+		start_date_str = from_date_obj.strftime("%Y%m%d")
+		end_date_str = to_date_obj.strftime("%Y%m%d")
+		
+		# Query Canada Post API for manifests
+		url = f"/rs/{self.settings.customer_number}/{self.settings.customer_number}/manifest?start={start_date_str}&end={end_date_str}"
+		headers = {'Accept': 'application/vnd.cpc.manifest-v8+xml'}
+		
+		try:
+			response = self.get_response(url, None, headers=headers, method='GET')
+		except Exception as e:
+			frappe.log_error(
+				title="Canada Post - Get Manifests Error",
+				message=f"Error fetching manifests from {start_date_str} to {end_date_str}: {str(e)}\n{frappe.get_traceback()}"
+			)
+			return []
+		
+		if not response or 'manifests' not in response:
+			return []
+		
+		# Ensure manifest links is a list
+		manifest_links = response['manifests'].get('link', [])
+		if isinstance(manifest_links, dict):
+			manifest_links = [manifest_links]
+		
+		manifests_data = []
+		
+		for manifest_link in manifest_links:
+			try:
+				# Get detailed manifest info
+				manifest_response = self.get_response(
+					manifest_link['@href'], 
+					None, 
+					headers={'Accept': manifest_link['@media-type']}, 
+					method='GET'
+				)
+				
+				if manifest_response and 'manifest' in manifest_response:
+					manifest_info = manifest_response['manifest']
+					
+					# Extract manifest data
+					manifest_data = {
+						'po_number': manifest_info.get('po-number'),
+						'manifest_date': manifest_info.get('manifest-date'),
+						'links': {}
+					}
+					
+					# Store links for artifacts and shipments
+					if 'links' in manifest_info and 'link' in manifest_info['links']:
+						links = manifest_info['links']['link']
+						if isinstance(links, dict):
+							links = [links]
+						
+						for link in links:
+							rel = link.get('@rel')
+							if rel in ['artifact', 'manifestShipments']:
+								manifest_data['links'][rel] = {
+									'href': link['@href'],
+									'media_type': link['@media-type']
+								}
+					
+					manifests_data.append(manifest_data)
+					
+			except Exception as e:
+				frappe.log_error(
+					title="Canada Post - Get Manifest Details Error",
+					message=f"Error getting manifest from {manifest_link.get('@href', 'unknown')}: {str(e)}"
+				)
+				continue
+		
+		return manifests_data
 
 	def get_shipment_manifest(self, shipment="SHIPMENT-00009"):
 		doc = frappe.get_doc("Shipment", shipment)
@@ -483,14 +699,16 @@ class CanadaPost():
 		return self.create_file_doc(file_name, file_path, doc, len(res.content), field_name)
 
 	def create_file_doc(self, file_name, file_path, doc, file_size=0, field_name=None):
+		attached_to_doctype = getattr(doc, 'parenttype', doc.doctype)
+		attached_to_name = getattr(doc, 'parent', doc.name)
 		file_doc = frappe.new_doc('File')
 		file_doc.update({
 			'file_name': f"{file_name}",
 			'file_url': file_path.replace(frappe.get_site_path(), ''),
 			'is_private': 1,
 			'folder': 'Home/Attachments',
-			'attached_to_doctype': doc.parenttype,
-			'attached_to_name': doc.parent,
+			'attached_to_doctype': attached_to_doctype,
+			'attached_to_name': attached_to_name,
 			'attached_to_field': field_name,
 			'file_size': file_size,
 		})
@@ -508,10 +726,32 @@ class CanadaPost():
 		to_be_remove = []
 		for shipment in doc.get('shipments', {'name': ('in', shipments_name or [])}):
 			url = self.xml_to_json(shipment.tracking_url)
-			res = self.get_response(url['link']['@href'], None, {
-									'Accept': url['link']['@media-type'], 'Content-Type': url['link']['@media-type']}, True, 'DELETE')
-			if res.status_code == 204:
-				to_be_remove.append(shipment)
+			try:
+				res = self.get_response(
+					url['link']['@href'],
+					None,
+					{
+						'Accept': url['link']['@media-type'],
+						'Content-Type': url['link']['@media-type']
+					},
+					True,
+					'DELETE'
+				)
+
+				# If we get a real Response object back
+				if hasattr(res, "status_code") and res.status_code == 204:
+					to_be_remove.append(shipment)
+
+			except requests.exceptions.HTTPError as e:
+				if getattr(e, "response", None) and e.response.status_code == 404:
+					frappe.logger().info(
+						f"Canada Post void: shipment {shipment.name} not found remotely (404). "
+						"Proceeding to remove locally."
+					)
+					to_be_remove.append(shipment)
+				else:
+					raise
+
 		for row in to_be_remove:
 			doc.remove(row)
 
@@ -519,22 +759,71 @@ class CanadaPost():
 			doc.ais_shipment_status = "Not Shipped"
 
 		doc.save()
+
+		# Set a transient flag so before_cancel knows this came from avoid_shpment
+		doc._cancel_from_avoid_shipment = True
+		doc.cancel()
+		doc._cancel_from_avoid_shipment = False
+
+		delivery_notes = []
+		for row in doc.shipment_delivery_note:
+			if row.delivery_note not in delivery_notes:
+				delivery_notes.append(row.delivery_note)
+
+		for delivery_note in delivery_notes:
+			dn = frappe.get_doc("Delivery Note", delivery_note)
+			if dn.docstatus == 1:
+				dn.cancel()
 		return doc.as_dict()
 
 	def get_response(self, url, body, headers=None, return_request=False, method='POST', retry=False, retry_count=0):
 		if headers:
+			# Double check if charset is set in headers
+			ct = headers.get('Content-Type')
+			if ct and 'charset=' not in ct.lower():
+				headers['Content-Type'] = f'{ct}; charset=utf-8'
 			self.sess.headers.update(headers)
 		try:
+			if isinstance(body, str):
+				body = body.encode('utf-8')
+
 			r = self.sess.request(
-					method, 
-					url if url.startswith('https://') else f'{self.settings.host}{url}', 
-					data=body,
-					timeout=30)
+				method,
+				url if url.startswith('https://') else f'{self.settings.host}{url}',
+				data=body,
+				timeout=30
+			)
+
+			# Friendly handling for Canada Post outages
+			if r.status_code == 503:
+				# If caller wants the raw response, return it
+				if return_request:
+					return r
+
+				# Show a user-friendly message and stop further parsing
+				frappe.throw(
+					_("Canada Post is temporarily unavailable. Please wait and try again in a moment."),
+					title=_("Canada Post Unavailable")
+				)
+
+			# Explicitly handle 404 so caller can decide what to do
+			if r.status_code == 404:
+				if return_request:
+					# still return the raw response if caller asked for it
+					return r
+				# raise a clear exception for 404
+				raise requests.exceptions.HTTPError("404 Not Found", response=r)
+
 			r.raise_for_status()
+
 			if return_request:
 				return r
 			if r.status_code == 200:
+				# Check if content is empty before trying to parse XML
+				if not r.content or len(r.content.strip()) == 0:
+					return None
 				return self.xml_to_json(r.content)
+
 		except (requests.exceptions.SSLError, requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
 			# Handle both SSL and timeout errors with retry logic
 			if not retry and retry_count < 3:  # Max 3 retries
@@ -543,15 +832,19 @@ class CanadaPost():
 				error_type = "SSL" if isinstance(e, requests.exceptions.SSLError) else "Timeout"
 				frappe.logger().info(f"{error_type} Error, retrying in {delay} seconds...")
 				time.sleep(delay)
-				return self.get_response(url, body, headers,
-								  return_request, method, True, retry_count + 1)
+				return self.get_response(url, body, headers, return_request, method, True, retry_count + 1)
 			else:
 				frappe.log_error(
-					f"Max retries reached for {url}. Error: {str(e)}", 
+					f"Max retries reached for {url}. Error: {str(e)}",
 					"Canada Post API Error"
 				)
 				raise
 		except Exception as e:
+			# If this is an HTTPError with a 404, re‑raise so caller
+			# can handle it specially, instead of building XML error messages.
+			if isinstance(e, requests.exceptions.HTTPError) and getattr(e, "response", None) and e.response.status_code == 404:
+				raise
+
 			if 'r' not in locals():
 				frappe.throw(frappe.get_traceback())
 			res = r.content

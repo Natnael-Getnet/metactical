@@ -1,10 +1,10 @@
-{% include 'erpnext/selling/sales_common.js' %}
+
+erpnext.sales_common.setup_selling_controller();
 var old_tax_template;
 var base_in_words;
 
 frappe.ui.form.on('Sales Order', {
 	refresh: function(frm){
-
 		if (frm.doc.__islocal)
 			frm.set_value("neb_payment_completed_at", null)
 		
@@ -21,7 +21,7 @@ frappe.ui.form.on('Sales Order', {
 			
 			frm.remove_custom_button("Pick List", 'Create'); 
 			frm.add_custom_button(__('Pick List'), () => frm.events.create_pick_list_custom(frm), __("Create"));
-			frm.remove_custom_button("Work Order", 'Create');
+			// frm.remove_custom_button("Work Order", 'Create');
 			frm.remove_custom_button("Request for Raw Materials", 'Create'); 
 			frm.remove_custom_button("Project", 'Create'); 
 			frm.remove_custom_button("Subscription", 'Create'); 
@@ -136,7 +136,7 @@ frappe.ui.form.on('Sales Order', {
 		];
 		var data = [];
 		frm.doc.items.forEach(function(row){
-			if(row.delivered_by_supplier != 1 && row.delivered_qty == 0){
+			if(row.delivered_by_supplier != 1){
 				data.push({
 					"docname": row.name,
 					"item_code": row.item_code,
@@ -384,7 +384,6 @@ frappe.ui.form.on('Sales Order', {
 			}
 		})
 	},
-	
 	verify_address(frm) {
 		frappe.call({
 			method: "metactical.api.shipstation.verify_shipping_address",

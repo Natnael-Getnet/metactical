@@ -23,6 +23,18 @@ class DeliveryNoteCustom(DeliveryNote):
 		else:
 			super().save()
 
+	def before_save(self):		
+		# Metactical Customization: check in store pickups
+		sales_order = self.items[0].against_sales_order if self.items else None
+		if sales_order:
+			store_pickup = frappe.db.get_value("Sales Order", sales_order, "ifw_store_pickup")
+			if store_pickup:
+				shipment_settings = frappe.get_single("Shipment Settings")
+				store_addresses = [addr.address.strip() for addr in shipment_settings.store_address]
+
+				if self.shipping_address_name not in store_addresses:
+					frappe.throw(_("For store pickup orders, the shipping address must be one of the store addresses. Please update the shipping address."))
+
 	def on_update(self):
 		if self.docstatus == 0:
 			create_shipstation_orders(self.name)
@@ -87,22 +99,26 @@ class DeliveryNoteCustom(DeliveryNote):
 			for row in self.items:
 				if row.against_sales_order and row.against_sales_invoice is None:
 					sales_order = frappe.get_doc('Sales Order', row.against_sales_order)
-					
 					#check sales order is fully delivered and not billed
 					if sales_order.per_billed != 0 or sales_order.per_delivered != 100:
 						break
 					
 					#check sales order is fully paid
-					if sales_order.grand_total != sales_order.advance_paid:
+					if sales_order.grand_total - sales_order.advance_paid > 0.25:
 						break
 					sales_invoice = frappe.new_doc('Sales Invoice')
 					sales_invoice.update({'ignore_pricing_rule': sales_order.ignore_pricing_rule})
 					sales_invoice = make_sales_invoice(row.against_sales_order, sales_invoice)
 					sales_invoice.update({"ais_automated_creation": 1, "disable_rounded_total": 1})
+
+					for sales_invoice_item in sales_invoice.items:
+						sales_invoice_item.delivery_note = self.name
 					
 					#Get payment entry with Sales Order and add it to advance paid
 					sales_invoice.set_advances()
+					sales_invoice.save()
 					sales_invoice.submit()
+					frappe.db.commit()
 
 
 	def create_shipment(self):

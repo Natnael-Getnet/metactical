@@ -92,13 +92,13 @@ def get_column():
 		},
 		{
 			"fieldname":"preorder_level",
-			"label": "PreOrderLevel",
+			"label": "Re-order Level",
 			"width": 120,
 			"fieldtype": "Int",
 		},
 		{
 			"fieldname":"preorder_qty",
-			"label": "PreOrderQty",
+			"label": "Re-order Qty",
 			"width": 120,
 			"fieldtype": "Int",
 		},
@@ -163,7 +163,7 @@ def get_report_data(filters):
 				digit_rows_with_location.append(row)
 			else:
 				non_digit_rows_with_location.append(row)
-
+	print(data)
 	data = []
 
 	if digit_rows_with_location:
@@ -211,7 +211,7 @@ def get_conditions(filters, sales_order=None):
 @frappe.whitelist()
 def get_item_details(item, list_type="Selling"):
 	cond = " and selling = 1"
-	if list_type == "Buying": cond= " and buying = 1"
+	if list_type == "Buying": cond= " and buying = 1 and price_list like 'SUP%'"
 	rate = 0
 	date = frappe.utils.nowdate()
 	r = frappe.db.sql("select price_list_rate from `tabItem Price` where '{}' between valid_from and valid_upto and item_code = '{}' {} limit 1".format(date, item, cond))

@@ -18,8 +18,15 @@ from openpyxl.styles.borders import Border, Side
 from openpyxl import Workbook
 
 def queue_action(self, action, **kwargs):
-	#Run an action in background
+	"""Run an action in background. If the action has an inner function,
+	like _submit for submit, it will call that instead"""
+	# call _submit instead of submit, so you can override submit to call
+	# run_delayed based on some action
+	# See: Stock Reconciliation
 	from frappe.utils.background_jobs import enqueue
+
+	if hasattr(self, '_' + action):
+		action = '_' + action
 
 	if file_lock.lock_exists(self.get_signature()):
 		frappe.throw(_('This document is currently queued for execution. Please try again'),
@@ -132,6 +139,9 @@ def get_usaepay_account(transaction_key=None, merchant_id=None, lead_source=None
 		usaepay_account = frappe.db.exists("USAePay Accounts", {"merchant_id": merchant_id})
 	elif transaction_key:
 		source = frappe.db.get_value("Sales Order", {"neb_usaepay_transaction_key": transaction_key}, "source")
+
+		if not source:
+			source = frappe.db.get_value("SO USAePay Transaction", {"transaction_key": transaction_key}, "lead_source")
 
 		if source:
 			usaepay_account = frappe.db.exists("USAePay Accounts", {"lead_source": source})
@@ -432,42 +442,6 @@ def check_si_payment_status_for_so(sales_order):
 
 	return all_invoices_paid
 
-def get_customer_email_and_phone(customer):
-	contacts = frappe.db.sql("""select c.email_id, phone, c.mobile_no
-								from `tabContact` c
-								INNER JOIN `tabDynamic Link` dl on dl.parent=c.name
-								INNER Join `tabCustomer` cs on dl.link_name=cs.name
-								where  dl.link_doctype="Customer" and cs.name = "{0}"
-								ORDER BY c.creation desc
-								""".format(customer), as_dict=True)
-			
-
-	if len(contacts):
-		return contacts
-	else:
-		return None
-
-def search_customer_by_phone_email(phone_number, email):
-	email_filter = ""
-	if email:
-		email_filter = f"AND c.email_id like '%{email}%'"
-	
-	phone_filter = ""
-	if phone_number:
-		phone_filter = f"AND (c.phone like '%{phone_number}%' or c.mobile_no like '%{phone_number}%')"
-
-	customers = frappe.db.sql(f"""select cs.name
-								from `tabContact` c
-								INNER JOIN `tabDynamic Link` dl on dl.parent=c.name
-								INNER Join `tabCustomer` cs on dl.link_name=cs.name
-								where  dl.link_doctype="Customer" {email_filter} {phone_filter}
-								""", as_dict=True)
-
-	if len(customers):
-		return [customer.get('name') for customer in customers]
-	else:
-		return None
-	
 def read_file(file_path):
 	extn = os.path.splitext(file_path)[1][1:]
 
@@ -589,17 +563,27 @@ def sort_items_by_location(data):
 	data = []
 	if digit_rows_with_location:
 		def safe_location_sort(x):
-			parts = x["ifw_location"].split("-")
-			segments = []
-			for part in parts:
-				# Try to parse each segment as an int, fallback to string
-				try:
-					segments.append(int(part))
-				except ValueError:
-					segments.append(part)
-			return tuple(segments)
-
-		# Sort using the updated sorting function
+			parts = x['ifw_location'].split("-")
+			
+			# Handle first segment (numeric part)
+			first_segment = int(parts[0]) if parts and parts[0].isdigit() else 0
+			
+			# Handle second segment (safely get if exists)
+			second_segment = parts[1] if len(parts) > 1 else ""
+			
+			# Handle third segment (safely get if exists)
+			# Split by common separators in case the format is different
+			if len(parts) > 1:
+				# Check if second segment contains additional separators
+				second_part = parts[1]
+				sub_parts = second_part.split("|") if "|" in second_part else second_part.split()
+				third_segment = sub_parts[1] if len(sub_parts) > 1 else ""
+			else:
+				third_segment = ""
+				
+			return (first_segment, second_segment, third_segment)
+			
+		# Sort using the safe sorting function
 		data += sorted(digit_rows_with_location, key=safe_location_sort)
 		
 	if non_digit_rows_with_location:
@@ -613,3 +597,12 @@ def sort_items_by_location(data):
 		items.append(frappe._dict(row))
 	
 	return items
+
+@frappe.whitelist()
+def custom_parse_json(json_string, key=None):
+    """Parse JSON string and optionally return a key"""
+    try:
+        data = json.loads(json_string) if isinstance(json_string, str) else json_string
+        return data.get(key) if key else data
+    except:
+        return None

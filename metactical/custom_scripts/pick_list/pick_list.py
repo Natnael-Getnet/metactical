@@ -11,7 +11,7 @@ import barcode as _barcode
 from barcode.writer import ImageWriter
 from io import BytesIO
 from erpnext.stock.doctype.pick_list.pick_list import (validate_item_locations, set_delivery_note_missing_values, update_delivery_note_item,
-	create_dn_with_so, create_dn_wo_so)
+	create_dn_with_so, create_dn_wo_so, create_dn_for_pick_lists)
 from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note as create_delivery_note_from_sales_order
 import datetime
 from pytz import timezone
@@ -42,7 +42,6 @@ class CustomPickList(PickList):
 			
 	def validate(self):
 		super(CustomPickList, self).validate()
-		self.check_for_existing_draft()
 		self.validate_sales_order_shipping_address()
 		self.validate_duplicated_items()
   
@@ -72,34 +71,9 @@ class CustomPickList(PickList):
 			duplicated_items = set(duplicated_items)
 			frappe.throw(_("Sales Order {0} contains duplicate items: {1}. Please remove the duplicates.").format(so, ", ".join(duplicated_items)))
 
-	def update_sales_order_item(self, item, picked_qty, item_code):
-		item_table = "Sales Order Item" if not item.product_bundle_item else "Packed Item"
-		stock_qty_field = "stock_qty" if not item.product_bundle_item else "qty"
-		
-		# Metactical Customization: Take into consideration returned qty
-		already_picked, actual_qty, returned_qty = frappe.db.get_value(
-			item_table,
-			item.sales_order_item,
-			["picked_qty", stock_qty_field, "returned_qty"],
-		)
-		
-		if returned_qty is None:
-			returned_qty = 0
-
-		if self.docstatus == 1:
-			if (((already_picked + picked_qty - returned_qty) / actual_qty) * 100) > (
-				100 + flt(frappe.db.get_single_value("Stock Settings", "over_delivery_receipt_allowance"))
-			):
-				frappe.throw(
-					_(
-						"You are picking more than required quantity for {}. Check if there is any other pick list created for {}"
-					).format(item_code, item.sales_order)
-				)
-
-		frappe.db.set_value(item_table, item.sales_order_item, "picked_qty", already_picked + picked_qty)
-
 	def before_save(self):
 		super(CustomPickList, self).before_save()
+
 		# Metactical Customization: removed auto location assignement. Will remove the whole
 		# set_item_location in the future from this page
 		# self.set_item_locations()
@@ -144,16 +118,79 @@ class CustomPickList(PickList):
 		if self.do_not_create_delivery:
 			return
 		
-		pick_list = frappe.get_doc('Pick List', self.name)
-		validate_item_locations(pick_list)
+		# pick_list = frappe.get_doc('Pick List', self.name)
+		# validate_item_locations(pick_list)
 
-		sales_orders = [d.sales_order for d in pick_list.locations if d.sales_order]
+		# sales_orders = [d.sales_order for d in pick_list.locations if d.sales_order]
+		# sales_orders = set(sales_orders)
+
+		# delivery_note = None
+		# for sales_order in sales_orders:
+		# 	delivery_note = create_delivery_note_from_sales_order(sales_order,
+		# 		delivery_note, {"skip_item_mapping": True})
+		# 	delivery_note.update({
+		# 		'ignore_pricing_rule': frappe.db.get_value('Sales Order', sales_order, 'ignore_pricing_rule'),
+		# 		"disable_rounded_total": 1
+		# 	})
+		# 	#Add pick list submitted date in sales order
+		# 	sales_doc = frappe.get_doc("Sales Order", sales_order)
+		# 	sales_doc.update({"pick_list_submitted_date": datetime.datetime.now(timezone('US/Pacific')).strftime("%Y-%m-%d %H:%M:%S")})
+		# 	sales_doc.save()
+
+		# # map rows without sales orders as well
+		# if not delivery_note:
+		# 	delivery_note = frappe.new_doc("Delivery Note")
+
+		# item_table_mapper = {
+		# 	'doctype': 'Delivery Note Item',
+		# 	'field_map': {
+		# 		'rate': 'rate',
+		# 		'name': 'so_detail',
+		# 		'parent': 'against_sales_order',
+		# 	},
+		# 	'condition': lambda doc: abs(doc.delivered_qty) < abs(doc.qty) and doc.delivered_by_supplier!=1
+		# }
+
+		# item_table_mapper_without_so = {
+		# 	'doctype': 'Delivery Note Item',
+		# 	'field_map': {
+		# 		'rate': 'rate',
+		# 		'name': 'name',
+		# 		'parent': '',
+		# 	}
+		# }
+
+		# for location in pick_list.locations:
+		# 	if location.sales_order_item:
+		# 		sales_order_item = frappe.get_cached_doc('Sales Order Item', {'name':location.sales_order_item})
+		# 	else:
+		# 		sales_order_item = None
+
+		# 	source_doc, table_mapper = [sales_order_item, item_table_mapper] if sales_order_item \
+		# 		else [location, item_table_mapper_without_so]
+
+		# 	dn_item = map_child_doc(source_doc, delivery_note, table_mapper)
+
+		# 	if dn_item:
+		# 		dn_item.warehouse = location.warehouse
+		# 		dn_item.qty = location.picked_qty
+		# 		dn_item.batch_no = location.batch_no
+		# 		dn_item.serial_no = location.serial_no
+
+		# 		update_delivery_note_item(source_doc, dn_item, delivery_note)
+
+		# set_delivery_note_missing_values(delivery_note)
+
+		# delivery_note.pick_list = pick_list.name
+		# delivery_note.customer = pick_list.customer if pick_list.customer else None
+		# if pick_list.ais_source:
+		# 	delivery_note.source = pick_list.ais_source
+		# delivery_note.save()
+
+		delivery_note = create_dn_for_pick_lists(self.name)
+		sales_orders = [d.sales_order for d in self.locations if d.sales_order]
 		sales_orders = set(sales_orders)
-
-		delivery_note = None
 		for sales_order in sales_orders:
-			delivery_note = create_delivery_note_from_sales_order(sales_order,
-				delivery_note, skip_item_mapping=True)
 			delivery_note.update({
 				'ignore_pricing_rule': frappe.db.get_value('Sales Order', sales_order, 'ignore_pricing_rule'),
 				"disable_rounded_total": 1
@@ -162,56 +199,9 @@ class CustomPickList(PickList):
 			sales_doc = frappe.get_doc("Sales Order", sales_order)
 			sales_doc.update({"pick_list_submitted_date": datetime.datetime.now(timezone('US/Pacific')).strftime("%Y-%m-%d %H:%M:%S")})
 			sales_doc.save()
-
-		# map rows without sales orders as well
-		if not delivery_note:
-			delivery_note = frappe.new_doc("Delivery Note")
-
-		item_table_mapper = {
-			'doctype': 'Delivery Note Item',
-			'field_map': {
-				'rate': 'rate',
-				'name': 'so_detail',
-				'parent': 'against_sales_order',
-			},
-			'condition': lambda doc: abs(doc.delivered_qty) < abs(doc.qty) and doc.delivered_by_supplier!=1
-		}
-
-		item_table_mapper_without_so = {
-			'doctype': 'Delivery Note Item',
-			'field_map': {
-				'rate': 'rate',
-				'name': 'name',
-				'parent': '',
-			}
-		}
-
-		for location in pick_list.locations:
-			if location.sales_order_item:
-				sales_order_item = frappe.get_cached_doc('Sales Order Item', {'name':location.sales_order_item})
-			else:
-				sales_order_item = None
-
-			source_doc, table_mapper = [sales_order_item, item_table_mapper] if sales_order_item \
-				else [location, item_table_mapper_without_so]
-
-			dn_item = map_child_doc(source_doc, delivery_note, table_mapper)
-
-			if dn_item:
-				dn_item.warehouse = location.warehouse
-				dn_item.qty = location.picked_qty
-				dn_item.batch_no = location.batch_no
-				dn_item.serial_no = location.serial_no
-
-				update_delivery_note_item(source_doc, dn_item, delivery_note)
-
-		set_delivery_note_missing_values(delivery_note)
-
-		delivery_note.pick_list = pick_list.name
-		delivery_note.customer = pick_list.customer if pick_list.customer else None
-		if pick_list.ais_source:
-			delivery_note.source = pick_list.ais_source
 		delivery_note.save()
+		
+
 	
 	
 	def on_cancel(self):
@@ -342,7 +332,25 @@ class CustomPickList(PickList):
 	def validate_stock_qty(self):
 		from erpnext.stock.doctype.batch.batch import get_batch_qty
 		shipping_items = frappe.db.get_all('Pick List Shipping Item', fields=["item"], pluck='item')
-		
+
+		# Sum qty on all DRAFT Delivery Notes for this item/warehouse/(batch)
+		def get_draft_dn_qty(item_code, warehouse, batch_no=None):
+			conds = ["dn.docstatus = 0", "dni.item_code = %s", "dni.warehouse = %s"]
+			args = [item_code, warehouse]
+			if batch_no:
+				conds.append("IFNULL(dni.batch_no, '') = %s")
+				args.append(batch_no)
+			where = " AND ".join(conds)
+			res = frappe.db.sql(
+				f"""
+				SELECT COALESCE(SUM(dni.qty), 0)
+				FROM `tabDelivery Note Item` dni
+				INNER JOIN `tabDelivery Note` dn ON dn.name = dni.parent
+				WHERE {where}
+				""",
+				args,
+			)
+			return flt(res[0][0]) if res else 0.0
 
 		for row in self.get("locations"):
 			# Metactical Customization: Skip shipping items
@@ -351,44 +359,87 @@ class CustomPickList(PickList):
 
 			# Metactical Customization: If is product budle, validate individual items
 			if is_product_bundle(row.item_code):
-				bundle_items = frappe.get_all('Product Bundle Item', filters={'parent': row.item_code}, fields=['item_code', 'qty'])
-				for bundle_item in bundle_items:
-					bin_qty = frappe.db.get_value(
-						"Bin",
-						{"item_code": bundle_item.item_code, "warehouse": row.warehouse},
-						"actual_qty",
-					)
-					if row.qty > bin_qty:
-						frappe.throw(
-							_(
-								"At Row #{0}: The picked quantity {1} for the product budle item {2} is greater than available stock {3} in the warehouse {4}."
-							).format(row.idx, row.qty, bold(bundle_item.item_code), bin_qty, bold(row.warehouse)),
-						)
-			else:
-				if row.batch_no and not row.qty:
-					batch_qty = get_batch_qty(row.batch_no, row.warehouse, row.item_code)
+				bundle_items = frappe.get_all(
+					'Product Bundle Item',
+					filters={'parent': row.item_code},
+					fields=['item_code', 'qty']
+				)
+				for component in bundle_items:
+					component_required = flt(row.qty) * flt(component.qty or 1)
+					draft_dn_qty = get_draft_dn_qty(component.item_code, row.warehouse)
+					required_qty = component_required + draft_dn_qty
 
-					if row.qty > batch_qty:
+					bin_qty = flt(frappe.db.get_value(
+						"Bin",
+						{"item_code": component.item_code, "warehouse": row.warehouse},
+						"actual_qty",
+					) or 0)
+
+					if required_qty > bin_qty:
 						frappe.throw(
 							_(
-								"At Row #{0}: The picked quantity {1} for the item {2} is greater than available stock {3} for the batch {4} in the warehouse {5}."
-							).format(row.idx, row.item_code, batch_qty, row.batch_no, bold(row.warehouse)),
+								"Not enough stock at Row #{0}: Required Qty (Pick List {1} × Bundle {2} + Draft DN {3}) "
+								"for bundled item {4} exceeds Bin Stock {5} in Warehouse {6}."
+							).format(
+								row.idx,
+								flt(row.qty),
+								flt(component.qty or 1),
+								draft_dn_qty,
+								bold(component.item_code),
+								bin_qty,
+								bold(row.warehouse),
+							),
 							title=_("Insufficient Stock"),
 						)
+			else:
+				current_qty = flt(row.qty or 0)
 
+				# Batch-specific check
+				if getattr(row, "batch_no", None):
+					batch_qty = flt(get_batch_qty(row.batch_no, row.warehouse, row.item_code) or 0)
+					draft_dn_qty = get_draft_dn_qty(row.item_code, row.warehouse, row.batch_no)
+					required_qty = current_qty + draft_dn_qty
+
+					if required_qty > batch_qty:
+						frappe.throw(
+							_(
+								"Not enough stock at Row #{0}: Required Qty (Pick List {1} + Draft Delivery Notes: {2}) exceeds Batch Stock {3} "
+								"for Item {4} in Batch {5} at Warehouse {6}."
+							).format(
+								row.idx,
+								current_qty,
+								draft_dn_qty,
+								batch_qty,
+								bold(row.item_code),
+								bold(row.batch_no),
+								bold(row.warehouse),
+							),
+							title=_("Insufficient Stock"),
+						)
 					continue
 
-				bin_qty = frappe.db.get_value(
+				# Warehouse (Bin) check
+				bin_qty = flt(frappe.db.get_value(
 					"Bin",
 					{"item_code": row.item_code, "warehouse": row.warehouse},
 					"actual_qty",
-				)
+				) or 0)
+				draft_dn_qty = get_draft_dn_qty(row.item_code, row.warehouse)
+				required_qty = current_qty + draft_dn_qty
 
-				if row.qty > bin_qty:
+				if required_qty > bin_qty:
 					frappe.throw(
 						_(
-							"At Row #{0}: The picked quantity {1} for the item {2} is greater than available stock {3} in the warehouse {4}."
-						).format(row.idx, row.qty, bold(row.item_code), bin_qty, bold(row.warehouse)),
+							"Not enough stock at Row #{0}: Required Qty (Pick List: {1} + Draft Delivery Notes: {2}) exceeds Stock Qty: {3} "
+							"for Item {4} at Warehouse {5}."
+						).format(
+							row.idx,
+							current_qty,
+							draft_dn_qty,
+							bin_qty,
+							bold(row.item_code),
+							bold(row.warehouse),
+						),
 						title=_("Insufficient Stock"),
 					)
 		
@@ -474,7 +525,7 @@ class CustomPickList(PickList):
 			existing_pick_list_items = frappe.get_all("Pick List Item", filters={"sales_order": sales_order, "docstatus": 0}, fields=["name", "qty", "picked_qty", "item_code", "parent", "sales_order_item"])
 			
 			# # The actual qty of the items in the sales order
-			sales_order_items = frappe.get_all("Sales Order Item", filters={"parent": sales_order, "docstatus": 1}, fields=["item_code", "qty", "picked_qty", "name"])
+			sales_order_items = frappe.get_all("Sales Order Item", filters={"parent": sales_order}, fields=["item_code", "qty", "picked_qty", "name"])
 			sales_order_items = {item.name:item for item in sales_order_items}
 
 			# group existing pick list items by parent
@@ -553,7 +604,7 @@ def create_pick_list(source_name, target_doc=None):
 		return (
 			abs(item.delivered_qty) < abs(item.qty)
 			and item.delivered_by_supplier != 1
-			and is_stock_item
+			# and is_stock_item
 		)
 	
 	# Metactcal Customization: Add warehouse, sales order and source to item map

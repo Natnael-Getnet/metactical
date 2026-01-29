@@ -3,13 +3,24 @@ from __future__ import unicode_literals
 from . import __version__ as _app_version
 
 app_name = "metactical"
-app_title = "Metactical"
-app_publisher = "Techlift Technologies"
-app_description = "Metactical Custom ERPNext App"
+app_title = "Storebuilder Commerce"
+app_publisher = "Storebuilder Commerce Inc"
+app_description = "Storebuilder Commerce Inc ERPNext App"
 app_icon = "octicon octicon-file-directory"
 app_color = "grey"
-app_email = "palash@techlift.in"
+app_email = ""
 app_license = "MIT"
+app_logo_url =  "/assets/metactical/images/storebuilder-logo.png"
+
+add_to_apps_screen = [
+	{
+		"name": "storebuilder-commerce",
+		"logo": "/assets/metactical/images/storebuilder-logo.png",
+		"title": "Storebuilder Commerce Inc",
+		"route": "/app/home",
+		"has_permission": "metactical.check_app_permission",
+	}
+]
 
 # Includes in <head>
 # ------------------
@@ -53,6 +64,7 @@ doctype_js = {
 	"POS Profile": "custom_scripts/pos_profile/pos_profile.js",
  	"Item Group": "custom_scripts/item_group/item_group.js",
 	"Packing Slip": "custom_scripts/packing_slip/packing_slip.js",
+	"Email Campaign": "custom_scripts/email_campaign/email_campaign.js",
 	"BOM" : "custom_scripts/bom/bom.js",
 	"Operation": "custom_scripts/bom_operation/bom_operation.js"
 }
@@ -62,7 +74,6 @@ doctype_list_js = {
 	"Stock Reconciliation": "custom_scripts/stock_reconciliation/stock_reconciliation_list.js",
 	"Task": "custom_scripts/task/task_list.js",
 	"Project": "custom_scripts/project/project_list.js",
-	"Payment Entry": "custom_scripts/payment_entry/payment_entry_list.js",
 	"Pick List": "custom_scripts/pick_list/pick_list_list.js",
 	"Item": "custom_scripts/item/item_list.js",
 }
@@ -101,6 +112,11 @@ home_page = "login"
 
 # notification_config = "metactical.notifications.get_notification_config"
 
+website_context = {
+	"favicon": "/assets/metactical/images/favicon.ico",
+	"splash_image": "/assets/metactical/images/storebuilder.svg",
+}
+
 # Permissions
 # -----------
 # Permissions evaluated in scripted ways
@@ -124,6 +140,13 @@ doc_events = {
 		"after_insert": "metactical.barcode_generator.generate",
 		"validate": "metactical.barcode_generator.po_validate",
 	},
+	"Material Request": {
+		"before_save": "metactical.custom_scripts.material_request.material_request.before_save",
+		"on_submit": "metactical.custom_scripts.material_request.material_request.on_submit",
+	},
+	"Address": {
+		"validate": "metactical.custom_scripts.address.address.validate"
+	},
 	"Contact": {
 		"validate": "metactical.custom_scripts.contact.contact.validate"
 	},
@@ -143,15 +166,11 @@ doc_events = {
 	# "RabbitMQ Config": {
 	# 	"on_update": "metactical.custom_scripts.rabbitmq.integration.config_change_handler"
 	# }, 
-	"Payment Entry": {
-		"before_insert": "metactical.custom_scripts.payment_entry.payment_entry.before_insert",
-	},
 	"Stock Ledger Entry": {
 		"on_update": "metactical.metactical.doctype.item_inventory_output.item_inventory_output.on_sle_update",
 	},
-	"Item": {
-		"on_update": "metactical.custom_scripts.item.item.on_update",
-		"validate": "metactical.custom_scripts.item.item.validate",
+	"Payment Entry": {
+		"before_insert": "metactical.custom_scripts.payment_entry.payment_entry.before_insert"
 	}
 }
 
@@ -170,15 +189,13 @@ override_doctype_class = {
 	"Purchase Receipt": "metactical.custom_scripts.purchase_receipt.purchase_receipt.CustomPurchaseReceipt",
 	"Purchase Invoice": "metactical.custom_scripts.purchase_invoice.purchase_invoice.CustomPurchaseInvoice",
 	"Stock Entry": "metactical.custom_scripts.stock_entry.stock_entry.CustomStockEntry",
-	"Company": "metactical.custom_scripts.company.company.CustomCompany",
 	"Delivery Note": "metactical.custom_scripts.delivery_note.delivery_note.DeliveryNoteCustom",
 	"Company": "metactical.custom_scripts.company.company.CustomCompany",
 	"Auto Email Report": "metactical.custom_scripts.auto_email_report.auto_email_report.CustomAutoEmailReport",
-	"Material Request": "metactical.custom_scripts.material_request.material_request.CustomMaterialRequest",
 	"Shipment": "metactical.custom_scripts.shipment.shipment.CustomShipment",
 	"Prepared Report": "metactical.custom_scripts.prepared_report.prepared_report.CustomPreparedReport",
 	"Website Item": "metactical.custom_scripts.website_item.website_item.CustomWebsiteItem",
-	"Address": "metactical.custom_scripts.address.address.CustomAddress"
+	"Item": "metactical.custom_scripts.item.item.CustomItem"
 }
 
 # Scheduled Tasks
@@ -193,7 +210,7 @@ scheduler_events = {
 #	],
 	"daily": [
 		"metactical.reserved_calculation.recalculate_reserved_qty",
-		"metactical.custom_scripts.email_campaign.email_campaign.send_email_to_leads_or_contacts"
+		# "metactical.custom_scripts.email_campaign.email_campaign.send_email_to_leads_or_contacts"
 	],
 #	"hourly": [
 #		"metactical.api.shipstation.sync_shipping_status"
@@ -236,6 +253,7 @@ override_whitelisted_methods = {
 	"frappe.desk.doctype.tag.tag.add_tag": "metactical.custom_scripts.tag.tag.add_tag",
 	"frappe.desk.doctype.tag.tag.remove_tag": "metactical.custom_scripts.tag.tag.remove_tag",
 	"frappe.core.doctype.scheduled_job_type.scheduled_job_type.execute_event": "metactical.custom_scripts.scheduled_job_type.scheduled_job_type.execute_event",
+	"frappe.model.rename_doc.update_document_title": "metactical.utils.rename_doc.update_document_title"
 }
 #
 # each overriding function accepts a `data` argument;
@@ -323,7 +341,6 @@ fixtures = [{
 			'Purchase Order-column_break_33',
 			'Purchase Order-carrier_used',
 			'Purchase Order-tracking_id',
-			'Pick List Item-actual_qty',
 			'Purchase Invoice Item-ifw_location',
 			'Material Request Item-default_supplier',
 			'Purchase Order Item-ifw_retailskusuffix',
@@ -361,8 +378,6 @@ fixtures = [{
 			'Pick List-track_print_user',
 			'Lead Source-ifw_website_id',
 			'Mode of Payment-ifw_mapping_values',
-			'Customer-first_name',
-			'Customer-last_name',
 			'Customer-mobile',
 			'Customer-email',
 			'Item-ifw_item_notes2',
@@ -658,8 +673,6 @@ fixtures = [{
 			'Purchase Receipt Item-tax_rate',
 			'Purchase Receipt Item-tax_amount',
 			'Purchase Receipt Item-total_amount',
-			'Sales Invoice-restaurant',
-			'Sales Invoice-restaurant_table',
 			'Delivery Note-ais_skip_auto_invoice',
 			'Item-ais_blockfrmstoresale',
 			'Material Request-ais_suppliers',
@@ -798,10 +811,6 @@ fixtures = [{
 			'Task-total_expense_claim',
 			'Timesheet-salary_slip',
 			'Terms and Conditions-hr',
-			'Loan-repay_from_salary',
-			'Loan Repayment-repay_from_salary',
-			'Loan Repayment-payroll_payable_account',
-			'Loan Repayment-process_payroll_accounting_entry_based_on_employee',
 			'Lead Source-custom_neb_price_list',
 			'Item-neb_website_specifications',
 			'Item Group-neb_website_specifications',
@@ -811,7 +820,6 @@ fixtures = [{
 			'Pick List-ais_picked_by',
 			'POS Profile User-column_break_vcps1',
 			'POS Profile User-neb_pin',
-			'POS Profile-neb_taxes_and_charges',
 			'Item-custom_ais_related_sku',
 			'Shipment-custom_ais_require_signature',
 			'Shipment-custom_ais_do_not_safe_drop',
@@ -830,17 +838,13 @@ fixtures = [{
 			'Shipment-custom_dangerous_goods_mode',
 			"Lead Source-neb_company_address",
    			'Item-sb_tag',
-			'Item-item_detail',
-			"Item-request_ai_suggestion",
-			"Item-slugs_and_descriptions",
-			"Item-neb_paypal_restricted",
-			"Item-neb_airship_restricted",
-			"Shipment-neb_notification_email_sent",
 			"Shipment-custom_nondelivery_handling_option",
+			"Shipment-neb_notification_email_sent",
 			"Purchase Receipt Item-custom_neb_comment",
 			"Sales Invoice-neb_return_document",
-			"Shipment-neb_notification_email_sent",
 			"Shipment Parcel Template-custom_disabled",
+			"Item-reorder_months",
+			"Item-months_to_reorder",
 			"Sub Operation-time_in_secs",
 			"BOM Operation-time_in_secs",
 			"BOM Item-supplier",
@@ -851,11 +855,26 @@ fixtures = [{
 			"BOM-sample_details",
 			"BOM-retail_sku",
 			"BOM-sub_operations",
-			"Item-reorder_months",
-			"Item-months_to_reorder",
+			'Item-item_detail',
+			"Item-request_ai_suggestion",
+			"Item-slugs_and_descriptions",
+			"Item-neb_paypal_restricted",
+			"Item-neb_airship_restricted",
 			"Employee-short_code",
 			"Item-last_pinged_on",
-			"POS Profile-auto_logout_after_transaction"
+			"POS Profile-auto_logout_after_transaction",
+			"Sales Invoice Item-sales_person",
+			"Sales Order Item-sales_person",
+			"POS Profile User-allow_flat_rate",
+			"Item-is_published",
+			"Item Attribute Value-hide_when_out_of_stock",
+			"Pricing Rule-min_qty_to_stop_discount",
+			"POS Profile-neb_manual_orders_tag",
+			"Lead Source-neb_country",
+			"Item-display_weight",
+			"Stock Entry Detail-custom_ais_active_qoh",
+			"POS Profile-neb_allow_manual_order",
+			"Address-neb_mobile_not_formatted"
 		]]]
 	},
 	{
@@ -1390,7 +1409,41 @@ fixtures = [{
 			"Sales Taxes and Charges-autoname",
 			"Bin-autoname",
 			"Custom Field-label-width",
-			"Shipment Parcel-weight-precision"
+			"Shipment Parcel-weight-precision",
+			"Material Request-transfer_status-no_copy",
+			"Stock Reconciliation Item-current_amount-permlevel",
+			"Stock Reconciliation Item-current_valuation_rate-permlevel",
+			"Stock Reconciliation Item-amount-permlevel",
+			"Item Price-price_list_rate-permlevel",
+			"Stock Reconciliation Item-valuation_rate-permlevel",
+			"Stock Entry Detail-additional_cost-permlevel",
+			"Stock Entry Detail-base_rate-permlevel",
+			"Stock Entry Detail-valuation_rate-permlevel",
+			"Stock Entry Detail-amount-permlevel",
+			"Stock Entry Detail-basic_amount-permlevel",
+			"Purchase Order Item-base_amount-permlevel",
+			"Purchase Order Item-last_purchase_rate-permlevel",
+			"Purchase Order Item-amount-permlevel",
+			"Purchase Order Item-base_net_amount-permlevel",
+			"Purchase Order Item-net_amount-permlevel",
+			"Purchase Order Item-base_net_rate-permlevel",
+			"Purchase Order Item-net_rate-permlevel",
+			"Purchase Order Item-base_rate-permlevel",
+			"Purchase Order Item-base_price_list_rate-permlevel",
+			"Purchase Order Item-price_list_rate-permlevel",
+			"Purchase Order Item-rate-permlevel",
+			"Purchase Receipt Item-billed_amt-permlevel",
+			"Purchase Receipt Item-base_net_amount-permlevel",
+			"Purchase Receipt Item-net_amount-permlevel",
+			"Purchase Receipt Item-base_net_rate-permlevel",
+			"Purchase Receipt Item-net_rate-permlevel",
+			"Purchase Receipt Item-base_amount-permlevel",
+			"Purchase Receipt Item-amount-permlevel",
+			"Purchase Receipt Item-base_price_list_rate-permlevel",
+			"Purchase Receipt Item-price_list_rate-permlevel",
+			"Work Order-wip_warehouse-default",
+			"Work Order-fg_warehouse-default",
+			"Work Order-source_warehouse-default"
 		]]]
 	},
   	{
@@ -1414,14 +1467,12 @@ jinja = {
 		"metactical.custom_scripts.purchase_receipt.purchase_receipt.get_pr_items",
 		"metactical.barcode_generator.get_barcode",
 		"metactical.custom_scripts.sales_invoice.sales_invoice.si_mode_of_payment",
-		"metactical.custom_scripts.sales_invoice.sales_invoice.get_commercial_invoice",
-		"metactical.custom_scripts.sales_invoice.sales_invoice.get_totals",
 		"metactical.barcode_generator.get_barcode_for_print_format",
-		"metactical.custom_scripts.sales_invoice.sales_invoice.get_customer_info",
 		"metactical.metactical.doctype.ste_packing_slip.ste_packing_slip.get_item_details_for_print",
-		"metactical.custom_scripts.packing_slip.packing_slip.get_packing_slips_for_print",
  		"metactical.custom_scripts.utils.metactical_utils.get_password",
-		"metactical.custom_scripts.utils.metactical_utils.sort_items_by_location"
+		"metactical.custom_scripts.utils.metactical_utils.sort_items_by_location",
+		"metactical.barcode_generator.get_qr_for_print_format",
+		"metactical.custom_scripts.utils.metactical_utils.custom_parse_json"
 	]
 }
 

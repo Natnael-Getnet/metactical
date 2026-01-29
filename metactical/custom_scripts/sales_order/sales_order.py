@@ -13,14 +13,12 @@ from frappe.model.utils import get_fetch_values
 from erpnext.selling.doctype.sales_order.sales_order import SalesOrder
 from erpnext.accounts.party import get_party_account
 from frappe import _, msgprint
-from metactical.custom_scripts.utils.metactical_utils import ( 
-	queue_action
-)
-
-from metactical.custom_scripts.utils.metactical_utils import queue_action, check_si_payment_status_for_so
 from metactical.metactical.doctype.item_inventory_output.item_inventory_output import update_item_inventory_output
 from frappe.model.docstatus import DocStatus
-from frappe.integrations.doctype.webhook.webhook import enqueue_webhook
+from metactical.custom_scripts.utils.metactical_utils import ( 
+	queue_action, 
+	check_si_payment_status_for_so
+)
 
 class SalesOrderCustom(SalesOrder):
 	def save(self):
@@ -70,8 +68,10 @@ class SalesOrderCustom(SalesOrder):
 					has_linked_return = True
 			else:
 				has_linked_return = True
-    
-			if has_linked_return:
+
+
+			has_draft_dn = get_draft_dns(self.name)
+			if has_linked_return and len(has_draft_dn) == 0:
 				self.db_set("status", "Closed", notify=True)	
    
 	def on_submit(self):
@@ -79,40 +79,36 @@ class SalesOrderCustom(SalesOrder):
 
 		# Metactical Customization: Added
 		for item in self.items:
-			frappe.enqueue(update_item_inventory_output, item_code=item.item_code, queue='default')
+			frappe.enqueue(update_item_inventory_output, item_code=item.item_code, voucher_type="Sales Order", queue='default')
 
 	def on_cancel(self):
 		super(SalesOrderCustom, self).on_cancel()
 
 		# Metactical Customization: Added
 		for item in self.items:
-			frappe.enqueue(update_item_inventory_output, item_code=item.item_code, queue='default')
+			update_item_inventory_output(item_code=item.item_code, voucher_type="Sales Order")
 
 	def on_update_after_submit(self):
 		super().on_update_after_submit()
 
-		doc_before_update = self.get_doc_before_save()
-		# Metactical Customization: Check if shipping or billing address has changed
-		# and enqueue webhook if it has changed
-		if doc_before_update and doc_before_update.docstatus == 1:
-			original_shipping_address = doc_before_update.shipping_address
-			original_billing_address = doc_before_update.address_display
-   
-			if self.shipping_address != original_shipping_address or self.address_display != original_billing_address:
-				webhook = frappe.db.exists("Webhook", {
-					"webhook_doctype": "Sales Order",
-					"webhook_docevent": "on_update_after_submit",
-					"enabled": 1
-				})
-    
-				if webhook:
-					doc = frappe.get_doc("Sales Order", self.name)
-					enqueue_webhook(doc, frappe.get_doc("Webhook", webhook))
-
 		for item in self.items:
 			frappe.enqueue(update_item_inventory_output, item_code=item.item_code, queue='default')
    
-   
+def get_draft_dns(sales_order):
+	draft_dn = frappe.db.sql("""
+		SELECT DISTINCT
+			dn.name AS delivery_note, dn.status
+		FROM `tabDelivery Note` dn
+		JOIN `tabDelivery Note Item` dni
+		ON dni.parent = dn.name
+		WHERE  dni.against_sales_order = %(sales_order)s
+		AND dn.docstatus = 1
+		AND dn.status = 'To Bill'
+		AND dn.is_return = 0
+	""", {"sales_order": sales_order}, as_dict=True)	
+ 
+	return draft_dn
+
 def get_return_delivery_note(sales_order):
 	rows = frappe.db.sql("""
 				SELECT DISTINCT
@@ -145,6 +141,7 @@ def get_return_sales_invoices(sales_order):
 	return rows
 
 
+			
 @frappe.whitelist()
 def save_cancel_reason(**args):
 	args = frappe._dict(args)
@@ -287,22 +284,10 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 	)
 	if automatically_fetch_payment_terms:
 		doclist.set_payment_schedule()
-
+  
+	doclist.set_onload("ignore_price_list", True)
+ 
 	return doclist
-
-@frappe.whitelist()
-def submit_order(doc):
-	# Metactical Customization: Submit order in background if more than 10 items
-	doc = frappe.get_doc("Sales Order", doc)
-	if len(doc.items) > 25:
-		msgprint(
-			_(
-				"The task has been enqueued as a background job. In case there is any issue on processing in background, the system will add a comment about the error on this document and revert to the Draft stage"
-			)
-		)
-		queue_action(doc, "submit", timeout=2000)
-	else:
-		doc._submit()
   
 @frappe.whitelist()
 def update_status(status, name):
