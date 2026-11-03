@@ -189,6 +189,7 @@ def _pack_order_complete_run(form_data: dict):
         pick_list_name = pick_list_result.get("pick_list", "")
 
         if not pick_list_result.get("success"):
+            _clear_created_documents([], pick_list_name, None, None)
             return _fail_with_log(log, pick_list_result.get("error"))
 
         pick_list = frappe.get_doc("Pick List", pick_list_name)
@@ -581,9 +582,13 @@ def reconcile_count(*args, **kwargs):
                 row["valuation_rate"] = item.get("valuation_rate")
             sr.append("items", row)
 
-        sr.insert()
-        sr_name = sr.name
-        sr.submit()
+        frappe.flags.ignore_warehouse_permissions = True
+        try:
+            sr.insert()
+            sr_name = sr.name
+            sr.submit()
+        finally:
+            frappe.flags.ignore_warehouse_permissions = False
         frappe.db.commit()
 
         _attribute_pps_write("Stock Reconciliation", sr.name)
@@ -1295,40 +1300,34 @@ def validate_packing_slips(packing_slips, order_id):
     """
 
     errors = []
+    # Accumulate total qty per sales_order_item across all slips — the same
+    # SOI can appear in multiple rows when the picker splits across warehouses.
+    qty_by_soi = {}
+
     for index, slip in enumerate(packing_slips, start=1):
         items = slip.get("items") or []
         if not items:
-            errors.append(
-                f"Packing slip {index} has no items."
-            )
+            errors.append(f"Packing slip {index} has no items.")
             continue
 
         for item in items:
-
             item_code = item.get("item_code")
             quantity = item.get("quantity")
             sales_order_item = item.get("sales_order_item")
 
             if not sales_order_item:
-                errors.append(
-                    f"Missing sales_order_item in packing slip {index}."
-                )
+                errors.append(f"Missing sales_order_item in packing slip {index}.")
                 continue
 
             if not quantity or quantity <= 0:
-                errors.append(
-                    f"Invalid quantity for item {sales_order_item}."
-                )
+                errors.append(f"Invalid quantity for item {sales_order_item}.")
                 continue
 
             so_item = frappe.db.get_value(
                 "Sales Order Item",
-                {
-                    "name": sales_order_item,
-                    "parent": order_id
-                },
+                {"name": sales_order_item, "parent": order_id},
                 ["item_code", "qty"],
-                as_dict=True
+                as_dict=True,
             )
 
             if not so_item:
@@ -1338,64 +1337,182 @@ def validate_packing_slips(packing_slips, order_id):
                 continue
 
             if item_code and so_item.item_code != item_code:
-                errors.append(
-                    f"Item code mismatch for SO Item {sales_order_item}."
-                )
+                errors.append(f"Item code mismatch for SO Item {sales_order_item}.")
+                continue
 
-            if quantity > so_item.qty:
-                errors.append(
-                    f"Quantity {quantity} exceeds ordered qty for {sales_order_item}."
-                )
+            entry = qty_by_soi.setdefault(sales_order_item, {"total": 0, "so_qty": so_item.qty})
+            entry["total"] += quantity
+
+    for soi, data in qty_by_soi.items():
+        if data["total"] > data["so_qty"]:
+            errors.append(
+                f"Total quantity {data['total']} exceeds ordered qty {data['so_qty']} for {soi}."
+            )
 
     return errors
 
 
+def _resolve_warehouse(warehouse):
+    """Return the full ERPNext warehouse name for `warehouse`.
+
+    If the name already exists in ERPNext it is returned unchanged.
+    Otherwise (e.g. the scanner produced 'W01-B-01-DD-02-03' without the
+    company suffix) we look for a warehouse whose name starts with that
+    code followed by ' - ', and return the first match.  Falls back to
+    the original value so the caller gets a useful error from ERPNext
+    rather than a silent null.
+    """
+    if not warehouse:
+        return warehouse
+    if frappe.db.exists("Warehouse", warehouse):
+        return warehouse
+    matches = frappe.db.get_all(
+        "Warehouse",
+        filters={"name": ["like", f"{warehouse} -%"]},
+        pluck="name",
+        limit=1,
+    )
+    return matches[0] if matches else warehouse
+
+
+def _create_delivery_note_from_pick_list(pick_list):
+    """Create a Delivery Note from a submitted pick list.
+
+    Replicates the logic in CustomPickList.on_submit but uses
+    delivery_note.append() for every row — including warehouse-split rows —
+    so Frappe always creates proper child Documents and _set_defaults can call
+    d.is_new() without a TypeError.
+    """
+    from erpnext.selling.doctype.sales_order.sales_order import (
+        make_delivery_note as create_dn_from_so,
+    )
+    import datetime
+    from pytz import timezone as _tz
+
+    sales_orders = list({d.sales_order for d in pick_list.locations if d.sales_order})
+    so = sales_orders[0] if sales_orders else None
+    if not so:
+        return None
+
+    delivery_note = create_dn_from_so(so)
+
+    # Group pick list locations by sales_order_item for split-warehouse mapping.
+    locations_by_soi = {}
+    for loc in pick_list.locations:
+        if loc.sales_order_item:
+            locations_by_soi.setdefault(loc.sales_order_item, []).append(loc)
+
+    dn_rows = []
+    total_discount_amount = 0
+
+    for item in delivery_note.items:
+        matching = locations_by_soi.get(item.so_detail, [])
+        if not matching:
+            continue
+
+        distributed_discount = flt(
+            frappe.db.get_value("Sales Order Item", item.so_detail, "distributed_discount_amount") or 0
+        )
+        total_ordered = flt(
+            frappe.db.get_value("Sales Order Item", item.so_detail, "qty") or 0
+        )
+
+        for location in matching:
+            if total_ordered:
+                total_discount_amount += (distributed_discount / total_ordered) * flt(location.picked_qty)
+
+            row = item.as_dict()
+            row["name"] = None
+            row["idx"] = None
+            row["qty"] = location.picked_qty
+            row["warehouse"] = _resolve_warehouse(location.warehouse)
+            row["pick_list_item"] = location.name
+            row["against_pick_list"] = pick_list.name
+            dn_rows.append(row)
+
+    delivery_note.update({
+        "ignore_pricing_rule": frappe.db.get_value("Sales Order", so, "ignore_pricing_rule"),
+        "disable_rounded_total": 1,
+    })
+
+    # Stamp the pick list submitted date on the SO.
+    for so_name in sales_orders:
+        so_doc = frappe.get_doc("Sales Order", so_name)
+        so_doc.pick_list_submitted_date = datetime.datetime.now(
+            _tz("US/Pacific")
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        so_doc.save()
+
+    # Use append() for every row so Frappe builds proper child Documents
+    # (avoids the frappe._dict / is_new() TypeError from direct list assignment).
+    delivery_note.items = []
+    for row in dn_rows:
+        delivery_note.append("items", row)
+    delivery_note.discount_amount = total_discount_amount
+
+    delivery_note.save()
+    frappe.db.commit()
+    return delivery_note.name
+
+
 def create_pick_list_for_order(order_id, items):
     """
-    Create pick list using provided quantities.
+    Create pick list using provided quantities and warehouses.
+
+    A single SO item can appear more than once in `items` when the picker
+    splits it across multiple warehouses (e.g. 2 units from bin A + 1 unit
+    from bin B for the same sales_order_item).  Each PPS entry becomes its
+    own Pick List Item row so the warehouse is preserved natively through to
+    the Delivery Note.
     """
+    pick_list = None
     try:
         pick_list = create_pick_list(source_name=order_id)
 
-        items_dict = {
-            i["sales_order_item"]: i
-            for i in items
-        }
+        # Group PPS entries by sales_order_item — same SOI can appear multiple
+        # times when stock is split across warehouses.
+        items_by_soi = {}
+        for i in items:
+            items_by_soi.setdefault(i["sales_order_item"], []).append(i)
 
         valid_locations = []
         for location in pick_list.locations:
-
-            sales_order_item = location.get("sales_order_item")
-            if sales_order_item not in items_dict:
+            soi = location.get("sales_order_item")
+            if soi not in items_by_soi:
                 continue
 
-            item_data = items_dict[sales_order_item]
-            location.qty = item_data["quantity"]
-            valid_locations.append(location)
+            for pps_entry in items_by_soi[soi]:
+                loc = location.as_dict()
+                loc["name"] = None
+                loc["idx"] = None
+                loc["qty"] = pps_entry["quantity"]
+                loc["stock_qty"] = pps_entry["quantity"]
+                loc["picked_qty"] = pps_entry["quantity"]
+                if pps_entry.get("warehouse"):
+                    loc["warehouse"] = _resolve_warehouse(pps_entry["warehouse"])
+                valid_locations.append(loc)
 
         if not valid_locations:
-            return {
-                "success": False,
-                "error": "No valid items found for pick list."
-            }
+            return {"success": False, "error": "No valid items found for pick list."}
 
-        pick_list.locations = valid_locations
-        
+        pick_list.locations = []
+        for loc in valid_locations:
+            pick_list.append("locations", loc)
+
+        # Skip the custom on_submit DN creation (which has a bug when the same
+        # SOI appears on multiple locations). We create the DN ourselves below.
+        pick_list.do_not_create_delivery = 1
         pick_list.save()
         pick_list.submit()
 
-        return {
-            "success": True,
-            "pick_list": pick_list.name
-        }
+        _create_delivery_note_from_pick_list(pick_list)
+
+        return {"success": True, "pick_list": pick_list.name}
 
     except Exception as e:
+        frappe.db.rollback()
         frappe.log_error(message=frappe.get_traceback(), title=f"Error creating pick list for order {order_id}")
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e), "pick_list": pick_list.name if pick_list else ""}
 
 def create_packing_slips(pick_list, packing_slips, round=1):
     """
@@ -1426,11 +1543,32 @@ def create_packing_slips(pick_list, packing_slips, round=1):
             packing_slip_doc = make_packing_slip(delivery_note)
             items = []
             for dn_item in packing_slip_doc.items:
+                matched_qty = 0
+                matched_soi = None
+                # Packing slip items don't have a warehouse field; look it up
+                # from the linked DN item row so we can match multi-bin picks.
+                dn_wh = ""
+                if dn_item.get("dn_detail"):
+                    dn_wh = frappe.db.get_value(
+                        "Delivery Note Item", dn_item.dn_detail, "warehouse"
+                    ) or ""
+
                 for slip_item in slip.get("items", []):
-                    if dn_item.item_code == slip_item.get("item_code"):
-                        dn_item.qty = slip_item.get("quantity")
-                        dn_item.sales_order_item = slip_item.get("sales_order_item")
-                        items.append(dn_item)
+                    if dn_item.item_code != slip_item.get("item_code"):
+                        continue
+                    slip_wh = slip_item.get("warehouse")
+                    if slip_wh and dn_wh:
+                        # Require exact warehouse match (resolve missing company suffix).
+                        if _resolve_warehouse(slip_wh) != dn_wh:
+                            continue
+                    matched_qty += slip_item.get("quantity", 0)
+                    matched_soi = slip_item.get("sales_order_item") or matched_soi
+
+                if matched_qty > 0:
+                    dn_item.qty = matched_qty
+                    if matched_soi:
+                        dn_item.sales_order_item = matched_soi
+                    items.append(dn_item)
                         
 
             dimensions = slip.get("dimensions") or {}
