@@ -123,9 +123,7 @@ def make_shipment(source_name, target_doc=None):
 			target.delivery_address_name = source.customer_address
 			target.delivery_address = source.address_display
 		warehouses = set(x.warehouse for x in source.items)
-		if len(warehouses) > 1:
-			frappe.throw(_("Delivery should be from one warehouse."))
-		target.warehouse = list(warehouses)[0]
+		target.warehouse = sorted(warehouses)[0] if warehouses else None
 
 	doclist = get_mapped_doc(
 		"Delivery Note",
