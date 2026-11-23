@@ -1,0 +1,199 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:IDO-IMP-{#####}",
+ "creation": "2026-11-21 10:00:00.000000",
+ "default_view": "List",
+ "description": "Bulk update Display Order In Listing from an Excel file. Rows marked Action Needed = Yes are saved (firing the Item webhooks) even when the value has not changed; rows marked No are skipped.",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "excel_file",
+  "column_break_file",
+  "status",
+  "section_counts",
+  "total_rows",
+  "rows_to_update",
+  "rows_skipped",
+  "rows_not_found",
+  "column_break_counts",
+  "updated",
+  "failed",
+  "section_errors",
+  "error_log",
+  "section_not_found",
+  "not_found_log",
+  "amended_from"
+ ],
+ "fields": [
+  {
+   "description": "Columns: Item Code, Display Order, Action Needed (Yes / No). Other columns are ignored.",
+   "fieldname": "excel_file",
+   "fieldtype": "Attach",
+   "in_list_view": 1,
+   "label": "Excel File",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_file",
+   "fieldtype": "Column Break"
+  },
+  {
+   "allow_on_submit": 1,
+   "default": "Draft",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "no_copy": 1,
+   "options": "Draft\nQueued\nIn Progress\nCompleted\nCompleted with Errors",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_counts",
+   "fieldtype": "Section Break",
+   "label": "Summary"
+  },
+  {
+   "fieldname": "total_rows",
+   "fieldtype": "Int",
+   "label": "Total Rows",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "rows_to_update",
+   "fieldtype": "Int",
+   "label": "Rows To Update (Action Needed = Yes)",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "rows_skipped",
+   "fieldtype": "Int",
+   "label": "Rows Skipped (Action Needed = No)",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "rows_not_found",
+   "fieldtype": "Int",
+   "label": "Rows Skipped (Item Not Found)",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_counts",
+   "fieldtype": "Column Break"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "updated",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Updated",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "failed",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Failed",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "collapsible_depends_on": "eval:doc.failed",
+   "fieldname": "section_errors",
+   "fieldtype": "Section Break",
+   "label": "Errors"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "error_log",
+   "fieldtype": "Long Text",
+   "label": "Error Log",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "depends_on": "rows_not_found",
+   "fieldname": "section_not_found",
+   "fieldtype": "Section Break",
+   "label": "Items Not Found"
+  },
+  {
+   "description": "Marked Yes in the file but not in ERPNext - skipped.",
+   "fieldname": "not_found_log",
+   "fieldtype": "Long Text",
+   "label": "Item Codes Not Found",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Item Display Order Import Tool",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2026-11-23 15:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Metactical",
+ "name": "Item Display Order Import Tool",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [
+  {
+   "color": "Gray",
+   "title": "Draft"
+  },
+  {
+   "color": "Blue",
+   "title": "Queued"
+  },
+  {
+   "color": "Orange",
+   "title": "In Progress"
+  },
+  {
+   "color": "Green",
+   "title": "Completed"
+  },
+  {
+   "color": "Red",
+   "title": "Completed with Errors"
+  }
+ ],
+ "track_changes": 1
+}
