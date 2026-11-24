@@ -7,6 +7,7 @@ from erpnext.stock.doctype.delivery_note.delivery_note import make_packing_slip
 import json
 from metactical.utils.shipping.shipping import get_rate
 from concurrent.futures import ThreadPoolExecutor
+import functools
 import time
 
 site = frappe.local.site
@@ -26,6 +27,73 @@ WAREHOUSE_PERMISSION_FIELDS = [
     "pps_target_warehouse",
 ]
 
+
+def _resolve_pps_actor():
+    """The User a PPS write runs as. Returns (actor, None), or
+    (None, error) when pps_user is missing or not an enabled User."""
+    actor = (frappe.form_dict or {}).get("pps_user")
+    if not actor or not isinstance(actor, str) or not actor.strip():
+        return None, "pps_user is required."
+    actor = actor.strip()
+    if not frappe.db.get_value("User", actor, "enabled"):
+        return None, f"pps_user '{actor}' is not an enabled ERPNext user."
+    return actor, None
+
+
+def _pps_write(fn):
+    """Run a PPS write endpoint in the pps_user's session (owner/modified_by
+    and permissions follow the real worker), restoring the shared session
+    after. Hard-fails before any work if pps_user is missing/invalid."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        actor, error = _resolve_pps_actor()
+        if error:
+            frappe.throw(error)
+        previous_user = frappe.session.user
+        # The ERP user that owns the PPS API key (the integration account). PPS
+        # API Log rows are written as this user, not the worker, so the doctype
+        # stays locked to the integration account — see _as_api_user.
+        frappe.flags.pps_api_key_user = previous_user
+        # frappe.set_user() resets frappe.local.form_dict to an empty _dict
+        # (frappe/__init__.py), which would wipe the request params the wrapped
+        # endpoint reads — leaving every call to see an empty payload (e.g.
+        # "Order ID is required."). Preserve it across both session switches.
+        saved_form_dict = frappe.local.form_dict
+        frappe.set_user(actor)
+        frappe.local.form_dict = saved_form_dict
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            frappe.set_user(previous_user)
+            frappe.local.form_dict = saved_form_dict
+
+    return wrapper
+
+
+def _as_api_user(fn):
+    """Run fn as the ERP user that owns the PPS API key — the session user
+    before @_pps_write switched to the worker — so PPS API Log rows are created
+    and edited by the integration account, not the floor worker. This is how the
+    PPS API Log doctype stays locked to that one account: nobody else is ever
+    the owner/modified_by of a log row, so no worker needs access to it.
+
+    Preserves form_dict across the switch (set_user resets it). Falls back to the
+    current session when there is no API-key user to switch to (e.g. called
+    outside @_pps_write)."""
+    api_user = frappe.flags.get("pps_api_key_user")
+    if not api_user or api_user == frappe.session.user:
+        return fn()
+    worker = frappe.session.user
+    saved_form_dict = frappe.local.form_dict
+    frappe.set_user(api_user)
+    frappe.local.form_dict = saved_form_dict
+    try:
+        return fn()
+    finally:
+        frappe.set_user(worker)
+        frappe.local.form_dict = saved_form_dict
+
+
 def _get_random_instock_items(warehouse, count):
     """Return `count` random items that have actual_qty >= 1 in `warehouse`."""
     rows = frappe.db.sql("""
@@ -42,6 +110,7 @@ def _get_random_instock_items(warehouse, count):
     return rows
 
 @frappe.whitelist()
+@_pps_write
 def create_sales_order(*args, **kwargs):
     """
     Create and submit a Sales Order using random in-stock items.
@@ -50,8 +119,10 @@ def create_sales_order(*args, **kwargs):
     Optional: company, warehouse, item_count (default 2), delivery_date,
               shipping_address_name, taxes_and_charges, source
     """
+    log = None
     try:
         form_data = dict(frappe.form_dict)
+        log = create_log(form_data, "Create Sales Order")
 
         customer = form_data.get("customer")
   
@@ -61,7 +132,7 @@ def create_sales_order(*args, **kwargs):
 
         stock_items = _get_random_instock_items(warehouse, item_count)
         if not stock_items:
-            return {"status": "error", "message": f"No in-stock items found in warehouse {warehouse}."}
+            return _fail_with_log(log, f"No in-stock items found in warehouse {warehouse}.")
 
         company_currency = frappe.get_cached_value("Company", company, "default_currency") or "CAD"
 
@@ -93,7 +164,7 @@ def create_sales_order(*args, **kwargs):
             })
 
         so.set_missing_values()
-        so.insert(ignore_permissions=True)
+        so.insert()
         so.submit()
         frappe.db.commit()
 
@@ -110,13 +181,20 @@ def create_sales_order(*args, **kwargs):
                 }],
             })
 
-        return {
+        response = {
             "order_id": so.name,
             "packing_slips": packing_slips,
         }
+        frappe.db.set_value("PPS API Log", log, "response", frappe.as_json(response))
+        frappe.db.commit()
+
+        return response
 
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Error creating sales order")
+        if log:
+            frappe.db.set_value("PPS API Log", log, "error", frappe.as_json(_error(str(e))))
+            frappe.db.commit()
         return {
             "status": "error",
             "message": str(e),
@@ -124,6 +202,7 @@ def create_sales_order(*args, **kwargs):
 
 
 @frappe.whitelist()
+@_pps_write
 def pack_order_complete(*args, **kwargs):
     """
     Packs an order: creates the Pick List, Delivery Note, Packing Slips and Shipment
@@ -149,10 +228,9 @@ def _pack_order_complete_run(form_data: dict):
     are tracked from the moment each becomes known so the outer `except`
     can always reach them.
 
-    Attribution: every document this call creates gets a Comment
-    ("Created through PPS by {user}") via `_attribute_pps_write`, using
-    `frappe.session.user` — this endpoint isn't `allow_guest`, so it only
-    runs in a real signed-in PPS user's session (see `authenticate`).
+    Runs in the pps_user's session (@_pps_write on pack_order_complete), so
+    created documents are owned by the real worker; rollback via
+    `_clear_created_documents` re-elevates to Administrator.
     """
     log = create_log(form_data, "Pack Order")
     order_id = form_data.get("order_id")
@@ -165,15 +243,15 @@ def _pack_order_complete_run(form_data: dict):
     try:
         # --- Validate input ---
         if not order_id:
-            return _error("Order ID is required.")
+            return _fail_with_log(log, "Order ID is required.")
 
         packing_slips = form_data.get("packing_slips") or []
         if not packing_slips:
-            return _error("Packing slips are required.")
+            return _fail_with_log(log, "Packing slips are required.")
 
         validation_errors = validate_packing_slips(packing_slips, order_id)
         if validation_errors:
-            return _error("; ".join(validation_errors))
+            return _fail_with_log(log, "; ".join(validation_errors))
 
         # --- Idempotency: a retried/duplicate call for an order that's
         # already been packed must not create a second Pick List/Delivery
@@ -194,7 +272,6 @@ def _pack_order_complete_run(form_data: dict):
 
         pick_list = frappe.get_doc("Pick List", pick_list_name)
         frappe.db.set_value("PPS API Log", log, "pick_list", pick_list.name)
-        _attribute_pps_write("Pick List", pick_list.name)
 
         # --- Create packing slips + delivery note ---
         packing_slip_docs, dn = create_packing_slips(pick_list, packing_slips)
@@ -202,11 +279,6 @@ def _pack_order_complete_run(form_data: dict):
         if len(packing_slip_docs) != expected_slip_count:
             _clear_created_documents(packing_slip_docs, pick_list_name, dn, shipment_name)
             return _fail_with_log(log, "Failed to create packing slips.")
-
-        if dn:
-            _attribute_pps_write("Delivery Note", dn)
-        for slip_name in packing_slip_docs:
-            _attribute_pps_write("Packing Slip", slip_name)
 
         frappe.db.set_value("PPS API Log", log, {
             "delivery_note": dn,
@@ -219,10 +291,8 @@ def _pack_order_complete_run(form_data: dict):
             _clear_created_documents(packing_slip_docs, pick_list_name, dn, shipment_name)
             return _fail_with_log(log, f"No shipment found for Delivery Note {dn}")
 
-        _attribute_pps_write("Shipment", shipment_name)
-
         # Trigger parcel auto-population
-        frappe.get_doc("Shipment", shipment_name).save(ignore_permissions=True)
+        frappe.get_doc("Shipment", shipment_name).save()
         frappe.db.commit()
 
         # --- Fetch shipping rates concurrently ---
@@ -252,6 +322,7 @@ def _pack_order_complete_run(form_data: dict):
         return _error(str(e))
 
 @frappe.whitelist()
+@_pps_write
 def create_label(*args, **kwargs):
     """
     Submit a shipment and create a shipping label using the selected rate
@@ -339,6 +410,7 @@ def create_label(*args, **kwargs):
                 "printing_disabled": printing_disabled,
                 "message": f"Labels already exist for shipment {shipment} using {provider}.",
             }
+            frappe.db.set_value("PPS API Log", log, "response", frappe.as_json(response))
             frappe.db.commit()
             return response
 
@@ -369,7 +441,7 @@ def create_label(*args, **kwargs):
             "message": f"Labels created successfully for shipment {shipment} using {provider}.",
         }
 
-        # frappe.db.set_value("PPS API Log", log, "response", frappe.as_json(response))
+        frappe.db.set_value("PPS API Log", log, "response", frappe.as_json(response))
         frappe.db.commit()
 
         return response
@@ -383,6 +455,7 @@ def create_label(*args, **kwargs):
 
 
 @frappe.whitelist()
+@_pps_write
 def update_shipment_parcels(*args, **kwargs):
     """
     Update weight and dimensions on a Shipment's parcel rows (shipment_parcel child table).
@@ -396,20 +469,21 @@ def update_shipment_parcels(*args, **kwargs):
                     PPS displays). Only the fields present in each entry are updated.
     """
     form_data = dict(frappe.form_dict)
+    log = create_log(form_data, "Update Shipment Parcels")
     shipment = form_data.get("shipment")
     parcels = form_data.get("parcels")
 
     if not shipment:
-        return _error("shipment is required.")
+        return _fail_with_log(log, "shipment is required.")
     if not frappe.db.exists("Shipment", shipment):
-        return _error(f"Shipment {shipment} does not exist.")
+        return _fail_with_log(log, f"Shipment {shipment} does not exist.")
     if not parcels:
-        return _error("parcels is required.")
+        return _fail_with_log(log, "parcels is required.")
     if isinstance(parcels, str):
         try:
             parcels = json.loads(parcels)
         except ValueError:
-            return _error("parcels must be valid JSON.")
+            return _fail_with_log(log, "parcels must be valid JSON.")
 
     try:
         doc = frappe.get_doc("Shipment", shipment)
@@ -432,24 +506,31 @@ def update_shipment_parcels(*args, **kwargs):
             updated_idxs.append(row.idx)
 
         if not updated_idxs:
-            return _error("No matching parcels found — check that the idx values match the shipment.")
+            return _fail_with_log(log, "No matching parcels found — check that the idx values match the shipment.")
 
-        doc.save(ignore_permissions=True)
+        doc.save()
         frappe.db.commit()
-        _attribute_pps_write("Shipment", shipment, action="Parcels updated")
 
-        return {
+        response = {
             "status": "success",
             "shipment": shipment,
             "updated_parcels": updated_idxs,
         }
+        frappe.db.set_value("PPS API Log", log, "response", frappe.as_json(response))
+        frappe.db.commit()
+
+        return response
 
     except Exception as e:
         frappe.log_error(message=frappe.get_traceback(), title=f"Error updating shipment parcels for {shipment}")
+        if log:
+            frappe.db.set_value("PPS API Log", log, "error", frappe.as_json(_error(str(e))))
+            frappe.db.commit()
         return _error(str(e))
 
 
 @frappe.whitelist()
+@_pps_write
 def receive_purchase_order(*args, **kwargs):
     """
     Create and submit a Purchase Receipt directly from a Purchase Order in
@@ -478,13 +559,13 @@ def receive_purchase_order(*args, **kwargs):
 
     try:
         if not purchase_order:
-            return _error("purchase_order is required.")
+            return _fail_with_log(log, "purchase_order is required.")
         if not frappe.db.exists("Purchase Order", purchase_order):
-            return _error(f"Purchase Order {purchase_order} does not exist.")
+            return _fail_with_log(log, f"Purchase Order {purchase_order} does not exist.")
 
         pr = make_purchase_receipt(purchase_order)
         if not pr.items:
-            return _error(f"No outstanding items to receive on Purchase Order {purchase_order}.")
+            return _fail_with_log(log, f"No outstanding items to receive on Purchase Order {purchase_order}.")
 
         if items:
             requested = {item.get("item_code"): item.get("qty") for item in items}
@@ -498,15 +579,13 @@ def receive_purchase_order(*args, **kwargs):
                     row.stock_qty = row.qty * flt(row.conversion_factor or 1)
                 kept_rows.append(row)
             if not kept_rows:
-                return _error("None of the requested items have outstanding qty on this Purchase Order.")
+                return _fail_with_log(log, "None of the requested items have outstanding qty on this Purchase Order.")
             pr.items = kept_rows
 
         pr.insert()
         pr_name = pr.name
         pr.submit()
         frappe.db.commit()
-
-        _attribute_pps_write("Purchase Receipt", pr.name)
 
         response = {
             "status": "success",
@@ -525,6 +604,8 @@ def receive_purchase_order(*args, **kwargs):
     except Exception as e:
         frappe.log_error(message=frappe.get_traceback(), title=f"Error receiving purchase order {purchase_order}")
         if pr_name and frappe.db.exists("Purchase Receipt", pr_name):
+            # Rollback runs privileged — the worker may not be able to cancel/delete.
+            frappe.set_user("Administrator")
             pr_doc = frappe.get_doc("Purchase Receipt", pr_name)
             if pr_doc.docstatus == 1:
                 pr_doc.cancel()
@@ -535,6 +616,7 @@ def receive_purchase_order(*args, **kwargs):
 
 
 @frappe.whitelist()
+@_pps_write
 def reconcile_count(*args, **kwargs):
     """
     Create and submit a Stock Reconciliation from a cycle count in one call.
@@ -558,14 +640,14 @@ def reconcile_count(*args, **kwargs):
 
     try:
         if not warehouse:
-            return _error("warehouse is required.")
+            return _fail_with_log(log, "warehouse is required.")
         if not items:
-            return _error("items is required.")
+            return _fail_with_log(log, "items is required.")
         if not reason_for_adjustment:
-            return _error("reason_for_adjustment is required.")
+            return _fail_with_log(log, "reason_for_adjustment is required.")
         for item in items:
             if not item.get("item_code") or item.get("qty") is None:
-                return _error("Each item requires item_code and qty.")
+                return _fail_with_log(log, "Each item requires item_code and qty.")
 
         sr = frappe.new_doc("Stock Reconciliation")
         sr.company = company
@@ -582,16 +664,10 @@ def reconcile_count(*args, **kwargs):
                 row["valuation_rate"] = item.get("valuation_rate")
             sr.append("items", row)
 
-        frappe.flags.ignore_warehouse_permissions = True
-        try:
-            sr.insert()
-            sr_name = sr.name
-            sr.submit()
-        finally:
-            frappe.flags.ignore_warehouse_permissions = False
+        sr.insert()
+        sr_name = sr.name
+        sr.submit()
         frappe.db.commit()
-
-        _attribute_pps_write("Stock Reconciliation", sr.name)
 
         response = {
             "status": "success",
@@ -610,6 +686,8 @@ def reconcile_count(*args, **kwargs):
     except Exception as e:
         frappe.log_error(message=frappe.get_traceback(), title=f"Error reconciling count for {warehouse}")
         if sr_name and frappe.db.exists("Stock Reconciliation", sr_name):
+            # Rollback runs privileged — see receive_purchase_order.
+            frappe.set_user("Administrator")
             sr_doc = frappe.get_doc("Stock Reconciliation", sr_name)
             if sr_doc.docstatus == 1:
                 sr_doc.cancel()
@@ -620,6 +698,7 @@ def reconcile_count(*args, **kwargs):
 
 
 @frappe.whitelist()
+@_pps_write
 def reopen_pick_list(*args, **kwargs):
     """
     Reopen a Pick List for re-picking in one call: clears `ais_picked_by`
@@ -637,9 +716,9 @@ def reopen_pick_list(*args, **kwargs):
 
     try:
         if not pick_list_name:
-            return _error("pick_list is required.")
+            return _fail_with_log(log, "pick_list is required.")
         if not frappe.db.exists("Pick List", pick_list_name):
-            return _error(f"Pick List {pick_list_name} does not exist.")
+            return _fail_with_log(log, f"Pick List {pick_list_name} does not exist.")
 
         frappe.db.set_value("Pick List", pick_list_name, "ais_picked_by", "")
 
@@ -667,11 +746,10 @@ def reopen_pick_list(*args, **kwargs):
                 tote.used_by = ""
             if tote.current_delivery_note and tote.current_delivery_note in dn_names:
                 tote.current_delivery_note = ""
-            tote.save(ignore_permissions=True)
+            tote.save()
             cleared_totes.append(tote.name)
 
         frappe.db.commit()
-        _attribute_pps_write("Pick List", pick_list_name, action="Reopened")
 
         response = {
             "status": "success",
@@ -687,6 +765,114 @@ def reopen_pick_list(*args, **kwargs):
     except Exception as e:
         frappe.log_error(message=frappe.get_traceback(), title=f"Error reopening pick list {pick_list_name}")
         return _fail_with_log(log, str(e))
+
+
+def _pps_create_and_submit(request_type, doctype, name_key):
+    """
+    Shared body for the PPS doc-building endpoints (Stock Entry, Stock
+    Reconciliation): insert and, by default, submit a document PPS built, as
+    the signed-in worker. The caller must be wrapped in @_pps_write, so the
+    document is owned by the real worker (owner/modified_by), not the shared
+    API-key account — which is the whole point over PPS's old /api/resource
+    write. Payload, response and error are written to the PPS API Log.
+
+    Reads `doc` (the document, with doctype forced to `doctype`) and `submit`
+    (default true) off the request.
+
+    On a failure before submit the orphaned draft is deleted so a retry does
+    not accumulate half-finished documents. A document that has already been
+    submitted is left intact: it carries stock ledger entries (and, for a
+    Stock Entry, a linked Repost Item Valuation) and must be cancelled through
+    ERPNext, not force-deleted here. Cleanup is isolated so it can never mask
+    the real error, and response logging is best-effort so it can never report
+    an already-committed document as failed.
+    """
+    form_data = dict(frappe.form_dict)
+    log = create_log(form_data, request_type)
+    name = None
+    submitted_ok = False
+
+    try:
+        doc = form_data.get("doc")
+        if not doc:
+            return _fail_with_log(log, "doc is required.")
+        if isinstance(doc, str):
+            try:
+                doc = json.loads(doc)
+            except ValueError:
+                return _fail_with_log(log, "doc must be valid JSON.")
+
+        submit = _as_bool(form_data.get("submit", True))
+
+        doc["doctype"] = doctype
+        d = frappe.get_doc(doc)
+
+        # PPS gates every move against its own warehouse permissions before the
+        # call, so skip ERPNext's warehouse check here. The write is still owned
+        # by the worker via @_pps_write.
+        frappe.flags.ignore_warehouse_permissions = True
+        try:
+            d.insert()
+            name = d.name
+            if submit:
+                d.submit()
+                submitted_ok = True
+        finally:
+            frappe.flags.ignore_warehouse_permissions = False
+        frappe.db.commit()
+
+        response = {
+            "status": "success",
+            name_key: d.name,
+            "submitted": bool(submit),
+            "docstatus": d.docstatus,
+        }
+        _log_response(log, response)
+        return response
+
+    except Exception as e:
+        frappe.log_error(message=frappe.get_traceback(), title=f"Error creating {doctype}")
+        if name and not submitted_ok:
+            try:
+                if frappe.db.get_value(doctype, name, "docstatus") == 0:
+                    frappe.delete_doc(doctype, name, ignore_permissions=True)
+                    frappe.db.commit()
+            except Exception:
+                frappe.db.rollback()
+                frappe.log_error(message=frappe.get_traceback(),
+                                 title=f"Error cleaning up draft {doctype} {name}")
+        return _fail_with_log(log, str(e))
+
+
+@frappe.whitelist()
+@_pps_write
+def create_stock_entry(*args, **kwargs):
+    """Insert and (by default) submit a PPS-built Stock Entry as the signed-in
+    worker, logged to the PPS API Log. See _pps_create_and_submit."""
+    return _pps_create_and_submit("Create Stock Entry", "Stock Entry", "stock_entry")
+
+
+@frappe.whitelist()
+@_pps_write
+def create_stock_reconciliation(*args, **kwargs):
+    """Insert and (by default) submit a PPS-built Stock Reconciliation (cycle
+    count) as the signed-in worker, logged to the PPS API Log. PPS builds the
+    full multi-warehouse document (one line per counted bin), so this takes the
+    whole doc rather than the simpler warehouse+items of reconcile_count. See
+    _pps_create_and_submit."""
+    return _pps_create_and_submit("Create Stock Reconciliation", "Stock Reconciliation", "stock_reconciliation")
+
+
+@frappe.whitelist()
+@_pps_write
+def create_purchase_receipt(*args, **kwargs):
+    """Insert and (by default) submit a PPS-built Purchase Receipt as the
+    signed-in worker, logged to the PPS API Log. PPS builds the receipt from
+    ERPNext's own make_purchase_receipt mapper (pricing/taxes/PO linkage) and
+    sends the whole doc, so this takes the full document rather than the
+    purchase_order+items of the older receive_purchase_order. See
+    _pps_create_and_submit."""
+    return _pps_create_and_submit("Create Purchase Receipt", "Purchase Receipt", "purchase_receipt")
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1061,7 +1247,10 @@ def _clear_created_documents(packing_slip_docs, pick_list_name, delivery_note, s
     delete any still-draft Delivery Note/Shipment tied to it, so by the
     time we get to the explicit Shipment/Delivery Note steps below they
     may already be gone — that's expected, not an error.
+
+    Recovery runs privileged; @_pps_write restores the session afterwards.
     """
+    frappe.set_user("Administrator")
     try:
         # Cancel and delete packing slips first — Frappe won't let you
         # cancel/delete a Pick List or Delivery Note that a submitted
@@ -1109,57 +1298,39 @@ def _clear_created_documents(packing_slip_docs, pick_list_name, delivery_note, s
         frappe.db.rollback()
 
 
-def _pps_actor() -> str:
-    """
-    Who to attribute a PPS write to.
-
-    `frappe.session.user` is the owner of the API key PPS authenticated with -
-    one shared integration account, the same value for every worker. The
-    person who actually did the work is only known to PPS, so it sends
-    `pps_user` on the request and that wins when present.
-    """
-    actor = (frappe.form_dict or {}).get("pps_user")
-    if actor and isinstance(actor, str) and actor.strip():
-        return actor.strip()
-    return frappe.session.user
-
-
-def _attribute_pps_write(doctype: str, docname: str, action: str = "Created", actor: str = None):
-    """
-    W4: stamp a Comment ("{action} through PPS by {user}") on every document
-    a PPS write method creates or mutates. Must be a Comment, never the
-    `remarks` field — a caller-supplied remark would silently overwrite it.
-    A failed comment must never roll back the real write, so this only
-    ever logs.
-
-    `actor` is the worker PPS names on the request; without it the comment
-    records the shared API-key account and every pack looks identical.
-    """
-    try:
-        user = actor or _pps_actor()
-        frappe.get_doc({
-            "doctype": "Comment",
-            "comment_type": "Comment",
-            "reference_doctype": doctype,
-            "reference_name": docname,
-            "content": f"{action} through PPS by {user}",
-        }).insert(ignore_permissions=True)
-    except Exception:
-        frappe.log_error(
-            message=frappe.get_traceback(),
-            title=f"PPS Attribution Error for {doctype} {docname}",
-        )
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _error(message: str) -> dict:
     return {"status": "error", "message": message}
 
-def _fail_with_log(log, message: str) -> dict:
-    if log:
-        frappe.db.set_value("PPS API Log", log, "error", json.dumps(_error(message)))
+def _log_response(log, response) -> None:
+    """Best-effort: record a success response on the PPS API Log. A logging
+    failure must never turn an already-committed operation into a reported
+    error, so this only ever logs its own failure and returns. Written as the
+    API-key user (see _as_api_user)."""
+    if not log:
+        return
+    def _write():
+        frappe.db.set_value("PPS API Log", log, "response", frappe.as_json(response))
         frappe.db.commit()
+    try:
+        _as_api_user(_write)
+    except Exception:
+        frappe.log_error(message=frappe.get_traceback(), title="PPS API Log response write failed")
+
+def _fail_with_log(log, message: str) -> dict:
+    """Record the error on the PPS API Log (as the API-key user) and return the
+    error payload. The log write is best-effort so it can never mask the real
+    failure it is reporting."""
+    if log:
+        def _write():
+            frappe.db.set_value("PPS API Log", log, "error", json.dumps(_error(message)))
+            frappe.db.commit()
+        try:
+            _as_api_user(_write)
+        except Exception:
+            frappe.log_error(message=frappe.get_traceback(), title="PPS API Log error write failed")
     return _error(message)
 
 
@@ -1604,7 +1775,9 @@ def create_packing_slips(pick_list, packing_slips, round=1):
         return created_slips, delivery_note
 
 def create_log(form_data, request_type):
-    try:
+    # Written as the API-key user (see _as_api_user) so the PPS API Log row is
+    # owned by the integration account, not the worker the endpoint runs as.
+    def _insert():
         log = frappe.get_doc({
             'doctype': 'PPS API Log',
             'request_type': request_type,
@@ -1613,6 +1786,8 @@ def create_log(form_data, request_type):
         log.insert(ignore_permissions=True)
         frappe.db.commit()
         return log.name
+    try:
+        return _as_api_user(_insert)
     except Exception as e:
-        frappe.log_error(title='POS API Log Error', message=frappe.get_traceback())
-        
+        frappe.log_error(title='PPS API Log Error', message=frappe.get_traceback())
+        return None
