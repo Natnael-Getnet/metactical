@@ -5,7 +5,9 @@
 
 Every row marked Action Needed = Yes is saved through the full Item save, even when the
 display order is already the same: the point of the row is to fire the Item webhooks and
-push the product to the websites again. Rows marked No are skipped, and so are rows whose
+push the product to the websites again. After each Item is saved, one of its variants gets
+Last Pinged On set to today and is saved too, so the variant webhooks fire once per template
+(see ping_variant). Rows marked No are skipped, and so are rows whose
 Item does not exist (counted and listed, not failed) - the same as the Item Supplier Import Tool.
 
 Saving thousands of Items is far too slow for one request or one job, so submit splits the
@@ -59,7 +61,7 @@ class ItemDisplayOrderImportTool(Document):
 		# Checked again here, not taken from validate: an item can be deleted in between.
 		missing = set(missing_items([r["item_code"] for r in rows]))
 		rows = [r for r in rows if r["item_code"] not in missing]
-		self.db_set({"status": "Queued", "updated": 0, "failed": 0, "error_log": "",
+		self.db_set({"status": "Queued", "updated": 0, "failed": 0, "variants_pinged": 0, "error_log": "",
 			"rows_to_update": len(rows), "rows_not_found": len(missing),
 			"not_found_log": "\n".join(sorted(missing))})
 		if not rows:
@@ -222,7 +224,7 @@ def process_chunk(docname, rows):
 		update_modified=False)
 	frappe.db.commit()
 
-	updated, not_found, errors = 0, [], []
+	updated, pinged, not_found, errors = 0, 0, [], []
 	for row in rows:
 		# error_text reads the last message: start each row clean so it can't pick up one
 		# left over from an earlier row or from the request that queued this job.
@@ -242,10 +244,37 @@ def process_chunk(docname, rows):
 		except Exception as e:
 			frappe.db.rollback()
 			errors.append(f"Row {row['row_no']} ({row['item_code']}): {error_text(e)}")
+			continue
 		finally:
 			frappe.local.message_log = []
 
-	record_chunk(docname, updated, errors, not_found)
+		# The template is already saved and counted: a failed ping only adds a line to the log.
+		try:
+			if ping_variant(row["item_code"]):
+				frappe.db.commit()
+				pinged += 1
+		except Exception as e:
+			frappe.db.rollback()
+			errors.append(f"Row {row['row_no']} ({row['item_code']}): updated, but pinging a variant failed: {error_text(e)}")
+		finally:
+			frappe.local.message_log = []
+
+	record_chunk(docname, updated, errors, not_found, pinged)
+
+
+def ping_variant(template):
+	"""Set Last Pinged On to today on one variant of the template and save it, which fires its
+	webhooks. One variant per template is enough. Prefers an enabled variant; returns the variant
+	saved, or None when the item has no variants (a plain item)."""
+	variants = frappe.get_all("Item", filters={"variant_of": template},
+		order_by="disabled asc, name asc", limit=1, pluck="name")
+	if not variants:
+		return None
+
+	variant = frappe.get_doc("Item", variants[0])
+	variant.last_pinged_on = frappe.utils.today()
+	variant.save()
+	return variant.name
 
 
 def error_text(e):
@@ -257,25 +286,26 @@ def error_text(e):
 	return (str(e) or type(e).__name__)[:300]
 
 
-def record_chunk(docname, updated, errors, not_found=()):
+def record_chunk(docname, updated, errors, not_found=(), pinged=0):
 	# One atomic UPDATE per chunk: chunks can run in parallel on several workers. An item
 	# deleted since submit moves from Rows To Update to Skipped (Item Not Found).
 	frappe.db.sql(
 		"""update `tabItem Display Order Import Tool`
 		set updated = ifnull(updated, 0) + %s,
+			variants_pinged = ifnull(variants_pinged, 0) + %s,
 			failed = ifnull(failed, 0) + %s,
 			error_log = concat(ifnull(error_log, ''), %s),
 			rows_to_update = ifnull(rows_to_update, 0) - %s,
 			rows_not_found = ifnull(rows_not_found, 0) + %s,
 			not_found_log = concat(ifnull(not_found_log, ''), %s)
 		where name = %s""",
-		(updated, len(errors), "".join(line + "\n" for line in errors),
+		(updated, pinged, len(errors), "".join(line + "\n" for line in errors),
 		 len(not_found), len(not_found), "".join("\n" + code for code in not_found), docname),
 	)
 	frappe.db.commit()
 
 	doc = frappe.db.get_value("Item Display Order Import Tool", docname,
-		["rows_to_update", "updated", "failed", "rows_not_found"], as_dict=True)
+		["rows_to_update", "updated", "failed", "rows_not_found", "variants_pinged"], as_dict=True)
 	if (doc.updated or 0) + (doc.failed or 0) >= (doc.rows_to_update or 0):
 		status = "Completed with Errors" if doc.failed else "Completed"
 		frappe.db.set_value("Item Display Order Import Tool", docname, "status", status,
@@ -283,5 +313,6 @@ def record_chunk(docname, updated, errors, not_found=()):
 		frappe.db.commit()
 		frappe.publish_realtime("msgprint",
 			f"Display order import {docname} finished: {doc.updated} updated, {doc.failed} failed, "
-			f"{doc.rows_not_found or 0} skipped (item not found).",
+			f"{doc.rows_not_found or 0} skipped (item not found), "
+			f"{doc.variants_pinged or 0} variant(s) pinged.",
 			user=frappe.session.user)

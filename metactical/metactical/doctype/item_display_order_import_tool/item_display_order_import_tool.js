@@ -10,8 +10,8 @@ frappe.ui.form.on("Item Display Order Import Tool", {
 		const running = ["Queued", "In Progress"].includes(frm.doc.status);
 
 		frm.dashboard.set_headline(
-			__("{0} of {1} processed: {2} updated, {3} failed, {4} skipped (item not found).",
-				[done, total, frm.doc.updated || 0, frm.doc.failed || 0, frm.doc.rows_not_found || 0]),
+			__("{0} of {1} processed: {2} updated, {3} failed, {4} skipped (item not found), {5} variants pinged.",
+				[done, total, frm.doc.updated || 0, frm.doc.failed || 0, frm.doc.rows_not_found || 0, frm.doc.variants_pinged || 0]),
 			running ? "orange" : (frm.doc.failed ? "red" : "green")
 		);
 
