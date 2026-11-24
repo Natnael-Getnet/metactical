@@ -18,6 +18,13 @@ try:
 except ImportError:
 	pass
 
+try:
+	from frappe.integrations.doctype.s3_backup_settings import s3_backup_settings
+	from metactical.custom_scripts.frappe.s3_backup import upload_file_to_s3
+	s3_backup_settings.upload_file_to_s3 = upload_file_to_s3
+except ImportError:
+	pass
+
 
 def check_app_permission():
 	import frappe
