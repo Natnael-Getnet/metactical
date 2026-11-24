@@ -6,6 +6,7 @@ from frappe import _, msgprint
 from frappe.model.document import Document
 from frappe.utils.xlsxutils import read_xlsx_file_from_attached_file, read_xls_file_from_attached_file
 from frappe.model.docstatus import DocStatus
+from frappe.utils import flt
 from frappe.utils.file_manager import save_file
 from metactical.custom_scripts.utils.metactical_utils import queue_action
 import os
@@ -65,51 +66,98 @@ class ItemSupplierImportTool(Document):
 		rows = data[1:]
 		limit = 500
 		start = 0
+		# Problems with the file (a bad quantity, an item or supplier row that doesn't exist) are
+		# collected over the whole file and logged once at the end: one Error Log per row buried
+		# the real errors under hundreds of these. Each list holds "Row N: ..." lines.
+		self._invalid_qty = []
+		self._items_not_found = []
+		self._suppliers_not_found = []
+		self._failed = 0
 		while start < len(rows):
 			end = start + limit
-			self._edit_item_supplier(rows[start:end], columns)
+			# +2: data[0] is the header and Excel rows start at 1
+			self._edit_item_supplier(rows[start:end], columns, first_row_no=start + 2)
 			start = end
+		self.log_file_problems()
 
-	def _edit_item_supplier(self, data, columns):
-		for row in data:
-			name = get_cell(row, columns, "Item Supplier Table Name")
-			supplier_part_no = get_cell(row, columns, "Supplier Part Number")
-			updated_qty = get_cell(row, columns, "Quantity To Update")
-			item_code = get_cell(row, columns, "Item Code")
-
-			try:
-				updated_qty = str(updated_qty).replace('+', '').strip()
-				updated_qty = float(updated_qty)
-				if updated_qty > 50:
-					updated_qty = 50
-			except Exception:
-				frappe.log_error(f"Skipping invalid qty {updated_qty} for supplier part number {supplier_part_no}, Item code {item_code}")
+	def log_file_problems(self):
+		sections = [
+			(self._invalid_qty, "row(s) have an invalid Quantity To Update", "invalid qty"),
+			(self._items_not_found, "item(s) do not exist", "item(s) not found"),
+			(self._suppliers_not_found, "supplier row(s) do not exist on their item", "supplier row(s) not found"),
+		]
+		lines, parts = [], []
+		for entries, heading, short in sections:
+			if not entries:
 				continue
+			if lines:
+				lines.append("")
+			lines.append(f"{len(entries)} {heading}:")
+			lines.extend(entries)
+			parts.append(f"{len(entries)} {short}")
 
-			exists = frappe.db.exists("Item", {"name": item_code})
-   
-			if exists:
-				try:
-					item = frappe.get_doc("Item", item_code)
-					supplier_exists = False
-					for supplier in item.supplier_items:
-						if supplier.name == name:
-							if not (supplier.ifw_supplier_qoh == updated_qty or (supplier.ifw_supplier_qoh > 49 and updated_qty == 50)):
-								supplier.ifw_supplier_qoh = updated_qty
-								supplier.ifw_sqohtimestamp = format_sqoh_date(frappe.utils.getdate())
-								item.save()
-								frappe.db.commit()
-							supplier_exists = True
-							break
-					if not supplier_exists:
-						frappe.log_error(f"Supplier {name} does not exist for item {item_code}")
-	  
-				except Exception as e:
-					frappe.log_error(f"Error inserting item supplier: {str(e)}")
-					frappe.publish_realtime("msgprint", "Error inserting item supplier : " + str(e), user=frappe.session.user)
-			else:
-				frappe.log_error(f"Item {item_code} does not exist")
-				frappe.publish_realtime("msgprint", f"Item {item_code} does not exist", user=frappe.session.user)
+		if lines:
+			title = f"Item Supplier Import {self.name}: {', '.join(parts)}"
+			frappe.log_error(title=title, message="\n".join(lines),
+				reference_doctype=self.doctype, reference_name=self.name)
+
+		# One popup for the whole import instead of one per failed row
+		if parts or self._failed:
+			if self._failed:
+				parts.append(f"{self._failed} row(s) failed with an error")
+			frappe.publish_realtime("msgprint",
+				f"Item Supplier Import {self.name} finished with: {', '.join(parts)}. "
+				"See the Error Log for the details.",
+				user=frappe.session.user)
+
+	def _edit_item_supplier(self, data, columns, first_row_no=2):
+		for row_no, row in enumerate(data, start=first_row_no):
+			# A failure is undone back to here and logged, and the import moves on to the next
+			# row. Without the savepoint a failed save's half-done writes stayed in the open
+			# transaction and went out with the next row's commit.
+			frappe.db.savepoint("item_supplier_row")
+			try:
+				self._edit_row(row, columns, row_no)
+			except Exception:
+				frappe.db.rollback(save_point="item_supplier_row")
+				self._failed += 1
+				item_code = get_cell(row, columns, "Item Code")
+				frappe.log_error(
+					title=f"Item Supplier Import {self.name}: row {row_no} ({item_code}) failed",
+					reference_doctype=self.doctype, reference_name=self.name)
+			finally:
+				frappe.local.message_log = []
+
+	def _edit_row(self, row, columns, row_no):
+		name = get_cell(row, columns, "Item Supplier Table Name")
+		raw_qty = get_cell(row, columns, "Quantity To Update")
+		item_code = get_cell(row, columns, "Item Code")
+
+		try:
+			updated_qty = float(str(raw_qty).replace('+', '').strip())
+		except (TypeError, ValueError):
+			self._invalid_qty.append(f"Row {row_no}: {raw_qty!r} for supplier row {name} (item {item_code})")
+			return
+		if updated_qty > 50:
+			updated_qty = 50
+
+		if not item_code or not frappe.db.exists("Item", {"name": item_code}):
+			self._items_not_found.append(f"Row {row_no}: {item_code or '(blank Item Code)'}")
+			return
+
+		item = frappe.get_doc("Item", item_code)
+		supplier = next((s for s in item.supplier_items if s.name == name), None)
+		if not supplier:
+			self._suppliers_not_found.append(f"Row {row_no}: {name} (item {item_code})")
+			return
+
+		current = flt(supplier.ifw_supplier_qoh)
+		if current == updated_qty or (current > 49 and updated_qty == 50):
+			return
+		supplier.ifw_supplier_qoh = updated_qty
+		supplier.ifw_sqohtimestamp = format_sqoh_date(frappe.utils.getdate())
+		item.save()
+		frappe.db.commit()
 
 
 @frappe.whitelist(methods=["POST"])
