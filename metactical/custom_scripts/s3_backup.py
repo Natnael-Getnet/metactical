@@ -53,10 +53,24 @@ MAX_BACKUP_AGE_HOURS = 3
 
 
 def _resolve_paths():
-    """Figure out the bench root / sites path from this file's location."""
-    bench_root = os.path.dirname(os.path.abspath(__file__))
-    sites_path = os.path.join(bench_root, "sites")
-    return bench_root, sites_path
+    """Locate the bench root (the dir containing both `sites` and `apps`).
+
+    Works whether this script sits at the bench root or inside an app, because
+    the cron `cd`s into the bench directory before running it. We search upward
+    from the current working directory first, then from this file's location."""
+    for start in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        d = start
+        while True:
+            if os.path.isdir(os.path.join(d, "sites")) and \
+               os.path.isdir(os.path.join(d, "apps")):
+                return d, os.path.join(d, "sites")
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    raise RuntimeError(
+        "Could not locate the bench root (a dir containing sites/ and apps/)"
+    )
 
 
 def _setup_logging(bench_root):
