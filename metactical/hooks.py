@@ -69,6 +69,7 @@ doctype_js = {
 	"Operation": "custom_scripts/bom_operation/bom_operation.js",
 	# Adds the "Revise Prices" button that opens the ICL Pricing grid (merged from the icl_pricing app).
 	"Supplier Order Confirmation V3": "public/js/price_grid_supplier_order_confirmation_v3.js",
+	"Supplier": "custom_scripts/supplier/supplier.js",
 }
 # doctype_js = {"doctype" : "public/js/doctype.js"}
 #doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
@@ -206,6 +207,7 @@ override_doctype_class = {
 	"Material Request": "metactical.custom_scripts.material_request.material_request.CustomMaterialRequest",
 	"Item Group": "metactical.custom_scripts.item_group.item_group.CustomItemGroup",
  	"Tag": "metactical.custom_scripts.tag.tag.CustomTag",
+	"Supplier": "metactical.custom_scripts.supplier.supplier.CustomSupplier",
 }
 
 # Scheduled Tasks
@@ -858,6 +860,10 @@ fixtures = [{
 			"Shipment-custom_nondelivery_handling_option",
 			"Shipment-neb_notification_email_sent",
 			"Purchase Receipt Item-custom_neb_comment",
+			"Purchase Receipt Item-neb_source_doctype",
+			"Purchase Receipt Item-neb_source_name",
+			"Purchase Receipt Item-neb_source_detail",
+			"Purchase Receipt Item-neb_box_no",
 			"Sales Invoice-neb_return_document",
 			"Shipment Parcel Template-custom_disabled",
 			"Item-months_to_reorder",
@@ -916,6 +922,7 @@ fixtures = [{
 			"Tag Link-autocreated",
 			"Item Attribute Value-color",
 			"Item Attribute Value-short_name",
+			"Item Attribute Value-nat_swatch_image",
 			"Website Specification Label-custom_show_in_table",
 			"Item Attribute-custom__nat_show_in_table",
 			"Item Attribute-custom_is_search_filter",
@@ -978,6 +985,10 @@ fixtures = [{
 			"Supplier-custom_column_break_duesj",
 			"Supplier-custom_sender_address",
 			"Supplier-custom_sender_email",
+			"Supplier-section_break_e11nr",
+			"Supplier-nat_po3_bcc_email",
+			"Supplier-nat_po3_signature_user",
+			"Supplier-nat_po3_signature",
 			"Sales Order Item-barcode"
 			"Supplier-po3_section"
 		]]]
@@ -1575,6 +1586,11 @@ fixtures = [{
 			"Item-item_group-in_list_view",
 			"Item-weight_uom-default",
 			"Supplier-main-field_order",
+			"Sales Invoice-status-length",
+			"Sales Invoice-is_opening-length",
+			"Sales Invoice-apply_discount_on-length",
+			"Sales Invoice-language-length",
+			"Sales Order Item-warehouse-search_index",
 		]]]
 	},
   	{
