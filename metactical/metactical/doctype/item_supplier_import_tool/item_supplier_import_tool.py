@@ -9,7 +9,13 @@ from frappe.model.docstatus import DocStatus
 from frappe.utils import flt
 from frappe.utils.file_manager import save_file
 from metactical.custom_scripts.utils.metactical_utils import queue_action
+from rq.timeouts import JobTimeoutException
 import os
+
+# A supplier file can have 50k+ rows. Most are unchanged and cost two lookups per 500 rows, but
+# every changed row is a full Item save, so give the job the long queue and plenty of time.
+QUEUE = "long"
+TIMEOUT = 4 * 60 * 60
 
 
 class ItemSupplierImportTool(Document):
@@ -23,7 +29,7 @@ class ItemSupplierImportTool(Document):
 					about the error on this document and revert to the Draft stage"
 				)
 			)
-			queue_action(self, "submit", timeout=2000)
+			queue_action(self, "submit", queue=QUEUE, timeout=TIMEOUT)
 		else:
 			super().save()
 
@@ -73,12 +79,23 @@ class ItemSupplierImportTool(Document):
 		self._items_not_found = []
 		self._suppliers_not_found = []
 		self._failed = 0
-		while start < len(rows):
-			end = start + limit
-			# +2: data[0] is the header and Excel rows start at 1
-			self._edit_item_supplier(rows[start:end], columns, first_row_no=start + 2)
-			start = end
-		self.log_file_problems()
+		self._total_rows = len(rows)
+		self._row_no = None
+		self._stopped_at = None
+		try:
+			while start < len(rows):
+				end = start + limit
+				# +2: data[0] is the header and Excel rows start at 1
+				self._edit_item_supplier(rows[start:end], columns, first_row_no=start + 2)
+				start = end
+		except JobTimeoutException:
+			# The job ran out of time. The rows before this one are saved; write down what was
+			# found so far before letting the timeout end the job (the worker kills it 60s later).
+			self._stopped_at = self._row_no
+			raise
+		finally:
+			self.log_file_problems()
+			frappe.db.commit()
 
 	def log_file_problems(self):
 		sections = [
@@ -87,6 +104,10 @@ class ItemSupplierImportTool(Document):
 			(self._suppliers_not_found, "supplier row(s) do not exist on their item", "supplier row(s) not found"),
 		]
 		lines, parts = [], []
+		if self._stopped_at:
+			lines += [f"The import stopped at row {self._stopped_at} of {self._total_rows + 1}: the background "
+				"job ran out of time. The rows before it were processed; the rows from it on were not.", ""]
+			parts.append(f"stopped at row {self._stopped_at} (timeout)")
 		for entries, heading, short in sections:
 			if not entries:
 				continue
@@ -111,13 +132,22 @@ class ItemSupplierImportTool(Document):
 				user=frappe.session.user)
 
 	def _edit_item_supplier(self, data, columns, first_row_no=2):
+		# Look the whole batch up in two queries, so a row whose quantity hasn't changed (most of
+		# them) never loads its Item. Loading every Item made a 40k-row file run out of time.
+		items, suppliers = self._lookup(data, columns)
+
 		for row_no, row in enumerate(data, start=first_row_no):
+			self._row_no = row_no
 			# A failure is undone back to here and logged, and the import moves on to the next
 			# row. Without the savepoint a failed save's half-done writes stayed in the open
 			# transaction and went out with the next row's commit.
 			frappe.db.savepoint("item_supplier_row")
 			try:
-				self._edit_row(row, columns, row_no)
+				self._edit_row(row, columns, row_no, items, suppliers)
+			except JobTimeoutException:
+				# not a row failure: the whole job is out of time, so stop (see edit_item_supplier)
+				frappe.db.rollback(save_point="item_supplier_row")
+				raise
 			except Exception:
 				frappe.db.rollback(save_point="item_supplier_row")
 				self._failed += 1
@@ -128,7 +158,19 @@ class ItemSupplierImportTool(Document):
 			finally:
 				frappe.local.message_log = []
 
-	def _edit_row(self, row, columns, row_no):
+	def _lookup(self, data, columns):
+		"""Items in this batch that exist (lowercase code -> code: names match case-insensitively,
+		like frappe.db.exists did) and their supplier rows (row name -> parent and current QOH)."""
+		codes = {str(c) for c in (get_cell(r, columns, "Item Code") for r in data) if c}
+		names = {str(n) for n in (get_cell(r, columns, "Item Supplier Table Name") for r in data) if n}
+		items = {code.lower(): code for code in
+			frappe.get_all("Item", filters={"name": ["in", list(codes)]}, pluck="name")} if codes else {}
+		suppliers = {s.name: s for s in frappe.get_all("Item Supplier",
+			filters={"name": ["in", list(names)], "parenttype": "Item"},
+			fields=["name", "parent", "ifw_supplier_qoh"])} if names else {}
+		return items, suppliers
+
+	def _edit_row(self, row, columns, row_no, items, suppliers):
 		name = get_cell(row, columns, "Item Supplier Table Name")
 		raw_qty = get_cell(row, columns, "Quantity To Update")
 		item_code = get_cell(row, columns, "Item Code")
@@ -141,23 +183,31 @@ class ItemSupplierImportTool(Document):
 		if updated_qty > 50:
 			updated_qty = 50
 
-		if not item_code or not frappe.db.exists("Item", {"name": item_code}):
+		item_name = items.get(str(item_code).lower()) if item_code else None
+		if not item_name:
 			self._items_not_found.append(f"Row {row_no}: {item_code or '(blank Item Code)'}")
 			return
 
-		item = frappe.get_doc("Item", item_code)
-		supplier = next((s for s in item.supplier_items if s.name == name), None)
-		if not supplier:
+		cached = suppliers.get(str(name)) if name else None
+		if not cached or cached.parent.lower() != item_name.lower():
 			self._suppliers_not_found.append(f"Row {row_no}: {name} (item {item_code})")
 			return
 
-		current = flt(supplier.ifw_supplier_qoh)
+		current = flt(cached.ifw_supplier_qoh)
 		if current == updated_qty or (current > 49 and updated_qty == 50):
+			return
+
+		item = frappe.get_doc("Item", item_name)
+		supplier = next((s for s in item.supplier_items if s.name == name), None)
+		if not supplier:
+			# removed from the Item since the batch was looked up
+			self._suppliers_not_found.append(f"Row {row_no}: {name} (item {item_code})")
 			return
 		supplier.ifw_supplier_qoh = updated_qty
 		supplier.ifw_sqohtimestamp = format_sqoh_date(frappe.utils.getdate())
 		item.save()
 		frappe.db.commit()
+		cached.ifw_supplier_qoh = updated_qty  # a later row for the same supplier row compares to this
 
 
 @frappe.whitelist(methods=["POST"])
@@ -199,7 +249,7 @@ def import_item_supplier():
 	# Updating each Item is too slow to finish within the request timeout,
 	# so submit in the background
 	item_supplier_import_tool.reload()
-	queue_action(item_supplier_import_tool, "submit", timeout=2000, enqueue_after_commit=True)
+	queue_action(item_supplier_import_tool, "submit", queue=QUEUE, timeout=TIMEOUT, enqueue_after_commit=True)
 	frappe.db.commit()
 
 	return {
